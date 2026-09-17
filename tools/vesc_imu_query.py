@@ -2,14 +2,16 @@
 """Uji kompatibilitas response COMM_GET_IMU_DATA=65 seperti VESC Tool."""
 import argparse, math, serial, struct, time
 from read_imu import crc16, read_frame
-PORT='/dev/serial/by-id/usb-1a86_USB_Serial-if00-port0'
+from serial_common import find_sideboard_port, open_sideboard_port
+PORT='auto'
 def packet(p):
     c=crc16(p);return bytes([2,len(p)])+p+bytes([c>>8,c&255,3])
 def fauto(b): return struct.unpack('>f',b)[0]
 def main():
     ap=argparse.ArgumentParser();ap.add_argument('--port',default=PORT);ap.add_argument('--baud',type=int,default=921600);a=ap.parse_args()
     mask=0xFFFF;req=bytes([65,mask>>8,mask&255])
-    with serial.Serial(a.port,a.baud,timeout=.05) as s:
+    portname=find_sideboard_port(a.port)
+    with open_sideboard_port(portname,a.baud,timeout=.05) as s:
         s.reset_input_buffer();s.write(packet(req));s.flush();end=time.monotonic()+1
         while time.monotonic()<end:
             p,e=read_frame(s)

@@ -13,13 +13,38 @@ void imu_calibration_start_still(ImuCalibration *c) { reset_common(c); c->state=
 void imu_calibration_start_rotate(ImuCalibration *c) { reset_common(c); c->state=IMU_CAL_ROTATE; }
 void imu_calibration_cancel(ImuCalibration *c) { reset_common(c); c->state=IMU_CAL_IDLE; }
 
+static void rotate_sensor_to_body(const float q[4], const float in[3], float out[3])
+{
+    /* v' = v + 2*qw*(qv x v) + 2*qv x (qv x v), q sensor->body. */
+    float cx=q[2]*in[2]-q[3]*in[1];
+    float cy=q[3]*in[0]-q[1]*in[2];
+    float cz=q[1]*in[1]-q[2]*in[0];
+    float c2x=q[2]*cz-q[3]*cy;
+    float c2y=q[3]*cx-q[1]*cz;
+    float c2z=q[1]*cy-q[2]*cx;
+    out[0]=in[0]+2.0f*(q[0]*cx+c2x);
+    out[1]=in[1]+2.0f*(q[0]*cy+c2y);
+    out[2]=in[2]+2.0f*(q[0]*cz+c2z);
+}
+
 void imu_apply_static_calibration(const ImuSample *raw, const PersistedSettings *s,
                                   float accel[3], float gyro[3])
 {
-    for (int i=0; i<3; i++) {
-        accel[i]=(raw->accel_mps2[i]-s->accel_offset[i])*s->accel_scale[i];
-        gyro[i]=raw->gyro_rads[i]-s->gyro_bias[i];
+    float dtemp=raw->temperature_c-s->calibration_temp_c;
+    if (dtemp>60.0f) dtemp=60.0f;
+    if (dtemp<-60.0f) dtemp=-60.0f;
+
+    float a_sensor_raw[3],a_sensor_cal[3],g_sensor[3];
+    for(int i=0;i<3;i++) {
+        a_sensor_raw[i]=raw->accel_mps2[i]-s->accel_offset[i]-s->accel_temp_slope[i]*dtemp;
+        g_sensor[i]=raw->gyro_rads[i]-s->gyro_bias[i]-s->gyro_temp_slope[i]*dtemp;
     }
+    for(int r=0;r<3;r++) {
+        a_sensor_cal[r]=0.0f;
+        for(int c=0;c<3;c++) a_sensor_cal[r]+=s->accel_transform[r*3+c]*a_sensor_raw[c];
+    }
+    rotate_sensor_to_body(s->sensor_to_body_q,a_sensor_cal,accel);
+    rotate_sensor_to_body(s->sensor_to_body_q,g_sensor,gyro);
 }
 
 static int sample_still(const ImuSample *s)
@@ -79,7 +104,14 @@ static int finish_still(ImuCalibration *c, PersistedSettings *set)
         candidate.gyro_std[i]=gyro_std[i];
         candidate.accel_std[i]=accel_std[i];
     }
-    candidate.calibration_temp_c=c->sum_temp/n;
+    float new_ref_temp=c->sum_temp/n;
+    float ref_shift=new_ref_temp-candidate.calibration_temp_c;
+    for (int i=0;i<3;i++) {
+        /* Rebase offset accel agar model thermal tetap kontinu saat reference
+         * temperature dipindah oleh kalibrasi diam baru. */
+        candidate.accel_offset[i]+=candidate.accel_temp_slope[i]*ref_shift;
+    }
+    candidate.calibration_temp_c=new_ref_temp;
     candidate.still_gyro_std_max_dps=max_gyro_std_dps;
     candidate.still_accel_std_max_g=max_accel_std_g;
     candidate.calibration_flags|=CAL_FLAG_STILL_VALID;
@@ -149,6 +181,25 @@ void imu_calibration_update(ImuCalibration *c,const ImuSample *s,PersistedSettin
     }
 }
 
+static int inverse3(const float A[3][3], float inv[3][3])
+{
+    float det=A[0][0]*(A[1][1]*A[2][2]-A[1][2]*A[2][1])
+             -A[0][1]*(A[1][0]*A[2][2]-A[1][2]*A[2][0])
+             +A[0][2]*(A[1][0]*A[2][1]-A[1][1]*A[2][0]);
+    if (fabsf(det)<0.10f) return 0;
+    float id=1.0f/det;
+    inv[0][0]=(A[1][1]*A[2][2]-A[1][2]*A[2][1])*id;
+    inv[0][1]=(A[0][2]*A[2][1]-A[0][1]*A[2][2])*id;
+    inv[0][2]=(A[0][1]*A[1][2]-A[0][2]*A[1][1])*id;
+    inv[1][0]=(A[1][2]*A[2][0]-A[1][0]*A[2][2])*id;
+    inv[1][1]=(A[0][0]*A[2][2]-A[0][2]*A[2][0])*id;
+    inv[1][2]=(A[0][2]*A[1][0]-A[0][0]*A[1][2])*id;
+    inv[2][0]=(A[1][0]*A[2][1]-A[1][1]*A[2][0])*id;
+    inv[2][1]=(A[0][1]*A[2][0]-A[0][0]*A[2][1])*id;
+    inv[2][2]=(A[0][0]*A[1][1]-A[0][1]*A[1][0])*id;
+    return 1;
+}
+
 int imu_calibration_finish_rotate(ImuCalibration *c,PersistedSettings *s)
 {
     if (!c || !s || c->state!=IMU_CAL_ROTATE) return 0;
@@ -161,39 +212,55 @@ int imu_calibration_finish_rotate(ImuCalibration *c,PersistedSettings *s)
         if (c->face_count[f]<ROTATE_FACE_MIN_SAMPLES) {
             c->state=IMU_CAL_FAILED; c->error_code=2U; return 0;
         }
-        float inv=1.0f/(float)c->face_count[f];
-        for (int i=0;i<3;i++) mean[f][i]=c->face_sum[f][i]*inv;
+        float invn=1.0f/(float)c->face_count[f];
+        for (int i=0;i<3;i++) mean[f][i]=c->face_sum[f][i]*invn;
     }
 
     PersistedSettings candidate=*s;
+    float offset[3]={0.0f,0.0f,0.0f};
     for (int axis=0;axis<3;axis++) {
-        float pos=mean[axis*2][axis];
-        float neg=mean[axis*2+1][axis];
-        float span=pos-neg;
-        float offset=0.5f*(pos+neg);
-        if (span<ROTATE_CAL_MIN_SPAN_G*GRAVITY_MPS2 ||
-            fabsf(offset)>ROTATE_CAL_MAX_OFFSET_G*GRAVITY_MPS2) {
-            c->state=IMU_CAL_FAILED; c->error_code=3U; return 0;
-        }
-        float scale=(2.0f*GRAVITY_MPS2)/span;
-        if (scale<ROTATE_CAL_SCALE_MIN || scale>ROTATE_CAL_SCALE_MAX) {
-            c->state=IMU_CAL_FAILED; c->error_code=3U; return 0;
-        }
-        candidate.accel_offset[axis]=offset;
-        candidate.accel_scale[axis]=scale;
+        for (int i=0;i<3;i++)
+            offset[i]+=0.5f*(mean[axis*2][i]+mean[axis*2+1][i])/3.0f;
     }
+    for (int i=0;i<3;i++) {
+        if (fabsf(offset[i])>ROTATE_CAL_MAX_OFFSET_G*GRAVITY_MPS2) {
+            c->state=IMU_CAL_FAILED; c->error_code=3U; return 0;
+        }
+        candidate.accel_offset[i]=offset[i];
+    }
+
+    /* measured = offset + A * true. Tiap kolom A didapat langsung dari
+     * pasangan centroid +axis/-axis. Runtime memakai T=A^-1. */
+    float A[3][3],T[3][3];
+    for (int axis=0;axis<3;axis++) {
+        for (int row=0;row<3;row++)
+            A[row][axis]=(mean[axis*2][row]-mean[axis*2+1][row])/(2.0f*GRAVITY_MPS2);
+        float cn=sqrtf(A[0][axis]*A[0][axis]+A[1][axis]*A[1][axis]+A[2][axis]*A[2][axis]);
+        if (cn<ROTATE_CAL_SCALE_MIN || cn>ROTATE_CAL_SCALE_MAX) {
+            c->state=IMU_CAL_FAILED; c->error_code=3U; return 0;
+        }
+    }
+    if (!inverse3(A,T)) { c->state=IMU_CAL_FAILED; c->error_code=6U; return 0; }
+    for (int r=0;r<3;r++) for (int col=0;col<3;col++)
+        candidate.accel_transform[r*3+col]=T[r][col];
 
     float sum_sq=0.0f,max_error=0.0f;
     for (int f=0;f<6;f++) {
-        float corrected[3];
-        for (int i=0;i<3;i++)
-            corrected[i]=(mean[f][i]-candidate.accel_offset[i])*candidate.accel_scale[i];
-        float norm=sqrtf(corrected[0]*corrected[0]+corrected[1]*corrected[1]+corrected[2]*corrected[2]);
-        float err=fabsf(norm/GRAVITY_MPS2-1.0f);
-        sum_sq+=err*err; if (err>max_error) max_error=err;
+        float corrected[3]={0.0f,0.0f,0.0f};
+        for (int r=0;r<3;r++) for (int col=0;col<3;col++)
+            corrected[r]+=T[r][col]*(mean[f][col]-offset[col]);
+        int axis=f/2; float sign=(f&1)?-1.0f:1.0f;
+        float e2=0.0f;
+        for (int i=0;i<3;i++) {
+            float target=(i==axis)?sign*GRAVITY_MPS2:0.0f;
+            float e=(corrected[i]-target)/GRAVITY_MPS2;
+            e2+=e*e;
+        }
+        float err=sqrtf(e2);
+        sum_sq+=err*err; if(err>max_error)max_error=err;
     }
     float rms=sqrtf(sum_sq/6.0f);
-    if (rms>ROTATE_CAL_RMS_MAX_G || max_error>ROTATE_CAL_MAX_ERROR_G) {
+    if(rms>ROTATE_CAL_RMS_MAX_G || max_error>ROTATE_CAL_MAX_ERROR_G) {
         c->state=IMU_CAL_FAILED; c->error_code=5U; return 0;
     }
 
@@ -202,7 +269,6 @@ int imu_calibration_finish_rotate(ImuCalibration *c,PersistedSettings *s)
     candidate.calibration_flags|=CAL_FLAG_ROTATE_VALID;
     candidate.rotate_cal_count++;
     *s=candidate;
-
     c->state=IMU_CAL_DONE; c->progress=1000U; c->event_saved_needed=1U;
     return 1;
 }

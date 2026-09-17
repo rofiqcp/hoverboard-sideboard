@@ -91,8 +91,10 @@ static void inject_state(EskfNav *f,const float dx[ESKF_NAV_DIM]) {
     quat_inject(f->q,&dx[IDX_TH]);
     for(int i=0;i<3;i++) {
         f->velocity[i]+=dx[IDX_V+i]; f->position[i]+=dx[IDX_P+i];
-        f->gyro_bias[i]=clampf_local(f->gyro_bias[i]+dx[IDX_BG+i],-0.5f,0.5f);
-        f->accel_bias[i]=clampf_local(f->accel_bias[i]+dx[IDX_BA+i],-5.0f,5.0f);
+        f->gyro_bias[i]=clampf_local(f->gyro_bias[i]+dx[IDX_BG+i],
+                                      -ESKF_GYRO_BIAS_LIMIT_RAD,ESKF_GYRO_BIAS_LIMIT_RAD);
+        f->accel_bias[i]=clampf_local(f->accel_bias[i]+dx[IDX_BA+i],
+                                      -ESKF_ACCEL_BIAS_LIMIT_MPS2,ESKF_ACCEL_BIAS_LIMIT_MPS2);
     }
 }
 
@@ -121,10 +123,13 @@ static void reset_covariance_attitude(EskfNav *f, const float dtheta[3]) {
 }
 
 static int update1_sparse(EskfNav *f,
-                          const uint8_t h_index[3], const float h_value[3], uint8_t h_count,
+                          const uint8_t *h_index, const float *h_value, uint8_t h_count,
                           float innov, float variance, float nis_gate,
-                          const float gravity_axis[3], uint8_t accel_bias_mode)
+                          const float gravity_axis[3], uint8_t accel_bias_mode,
+                          uint8_t gyro_bias_mode)
 {
+    if (!f || !h_index || !h_value || h_count==0U || h_count>ESKF_NAV_DIM ||
+        !isfinite(innov) || !isfinite(variance) || !(variance>0.0f)) return 0;
     float hp[ESKF_NAV_DIM];
     for (int c=0;c<ESKF_NAV_DIM;c++) {
         float v=0.0f;
@@ -134,7 +139,7 @@ static int update1_sparse(EskfNav *f,
 
     float S=variance;
     for (uint8_t j=0U;j<h_count;j++) S+=hp[h_index[j]]*h_value[j];
-    if (!(S>1e-12f)) return 0;
+    if (!isfinite(S) || !(S>1e-12f)) return 0;
     if (nis_gate>0.0f && innov*innov/S>nis_gate) return 0;
 
     float K[ESKF_NAV_DIM];
@@ -157,10 +162,29 @@ static int update1_sparse(EskfNav *f,
     } else if (accel_bias_mode==0U) {
         for (int i=0;i<3;i++) K[IDX_BA+i]=0.0f;
     }
+    if (gyro_bias_mode==0U) {
+        for (int i=0;i<3;i++) K[IDX_BG+i]=0.0f;
+    }
 
+    /* Batasi satu correction step dengan menskalakan gain, bukan sekadar dx.
+     * Karena covariance update memakai K yang sama, konsistensi Joseph-form tetap terjaga. */
+    float gain_scale=1.0f;
+    const float limits[5]={ESKF_ATTITUDE_STEP_MAX_RAD,ESKF_VELOCITY_STEP_MAX_MPS,
+                           ESKF_POSITION_STEP_MAX_M,ESKF_GYRO_BIAS_STEP_MAX_RAD,
+                           ESKF_ACCEL_BIAS_STEP_MAX_MPS2};
+    const int starts[5]={IDX_TH,IDX_V,IDX_P,IDX_BG,IDX_BA};
+    for(int group=0;group<5;group++) for(int i=0;i<3;i++) {
+        float correction=fabsf(K[starts[group]+i]*innov);
+        if(!isfinite(correction)) return 0;
+        if(correction>limits[group] && correction>1e-12f) {
+            float a=limits[group]/correction;
+            if(a<gain_scale) gain_scale=a;
+        }
+    }
+    if(gain_scale<1.0f) for(int r=0;r<ESKF_NAV_DIM;r++) K[r]*=gain_scale;
     for (int r=0;r<ESKF_NAV_DIM;r++) dxm[r]=K[r]*innov;
 
-    /* Joseph-equivalent scalar update tetap valid walau K diproyeksikan. */
+    /* Joseph-equivalent scalar update tetap valid walau K diproyeksikan/diskalakan. */
     for (int r=0;r<ESKF_NAV_DIM;r++) for (int c=r;c<ESKF_NAV_DIM;c++) {
         float v=f->P[r][c]-K[r]*hp[c]-hp[r]*K[c]+K[r]*S*K[c];
         Tm[r][c]=v; Tm[c][r]=v;
@@ -328,7 +352,7 @@ int eskf_nav_correct_gravity(EskfNav *f, const float accel[3], int stationary)
         float h_value[3]={sh[axis][0],sh[axis][1],sh[axis][2]};
 
         if (!update1_sparse(f,h_index,h_value,3U,innov,sigma*sigma,
-                            ESKF_GRAVITY_SCALAR_NIS_GATE,h,0U)) {
+                            ESKF_GRAVITY_SCALAR_NIS_GATE,h,0U,2U)) {
             f->gravity_reject_count++;
             continue;
         }
@@ -347,7 +371,7 @@ int eskf_nav_fuse_zero_velocity(EskfNav *f,float sigma)
         const uint8_t h_index[3]={(uint8_t)(IDX_V+axis),0U,0U};
         const float h_value[3]={1.0f,0.0f,0.0f};
         if (update1_sparse(f,h_index,h_value,1U,-f->velocity[axis],sigma*sigma,0.0f,
-                           gravity_axis,1U)) fused++;
+                           gravity_axis,1U,2U)) fused++;
     }
     if (fused==3) { f->zupt_count++; return 1; }
     return 0;
@@ -360,10 +384,169 @@ int eskf_nav_fuse_zero_rate(EskfNav *f,const float gyro[3],float sigma)
         const uint8_t h_index[3]={(uint8_t)(IDX_BG+axis),0U,0U};
         const float h_value[3]={1.0f,0.0f,0.0f};
         float innov=gyro[axis]-f->gyro_bias[axis];
-        if (update1_sparse(f,h_index,h_value,1U,innov,sigma*sigma,0.0f,0,0U)) fused++;
+        if (update1_sparse(f,h_index,h_value,1U,innov,sigma*sigma,0.0f,0,0U,2U)) fused++;
     }
     if (fused==3) { f->zero_rate_count++; return 1; }
     return 0;
+}
+
+
+
+static float wrap_pi(float x)
+{
+    while (x > PI_F) x -= 2.0f*PI_F;
+    while (x < -PI_F) x += 2.0f*PI_F;
+    return x;
+}
+
+int eskf_nav_fuse_world_velocity(EskfNav *f,const float velocity[3],float sigma)
+{
+    if(!f||!velocity||!isfinite(sigma)||sigma<AID_SIGMA_VEL_MIN_MPS||sigma>AID_SIGMA_VEL_MAX_MPS)return 0;
+    for(int axis=0;axis<3;axis++) {
+        if(!isfinite(velocity[axis])||fabsf(velocity[axis])>AID_WORLD_VEL_MAX_MPS ||
+           fabsf(velocity[axis]-f->velocity[axis])>AID_WORLD_VEL_INNOV_MAX_MPS) return 0;
+    }
+    int fused=0;
+    for(int axis=0;axis<3;axis++){
+        const uint8_t hi[1]={(uint8_t)(IDX_V+axis)};
+        const float hv[1]={1.0f};
+        if(update1_sparse(f,hi,hv,1U,velocity[axis]-f->velocity[axis],sigma*sigma,9.0f,0,2U,2U))fused++;
+    }
+    return fused==3;
+}
+
+int eskf_nav_fuse_world_position(EskfNav *f,const float position[3],float sigma)
+{
+    if(!f||!position||!isfinite(sigma)||sigma<AID_SIGMA_POS_MIN_M||sigma>AID_SIGMA_POS_MAX_M)return 0;
+    for(int axis=0;axis<3;axis++) {
+        if(!isfinite(position[axis])||fabsf(position[axis])>AID_WORLD_POS_MAX_M ||
+           fabsf(position[axis]-f->position[axis])>AID_WORLD_POS_INNOV_MAX_M) return 0;
+    }
+    int fused=0;
+    for(int axis=0;axis<3;axis++){
+        const uint8_t hi[1]={(uint8_t)(IDX_P+axis)};
+        const float hv[1]={1.0f};
+        if(update1_sparse(f,hi,hv,1U,position[axis]-f->position[axis],sigma*sigma,9.0f,0,2U,2U))fused++;
+    }
+    return fused==3;
+}
+
+int eskf_nav_fuse_body_velocity(EskfNav *f,const float velocity_body[3],uint8_t axis_mask,float sigma)
+{
+    if(!f||!velocity_body||axis_mask==0U||!isfinite(sigma)||
+       sigma<AID_SIGMA_VEL_MIN_MPS||sigma>AID_SIGMA_VEL_MAX_MPS)return 0;
+    float R[3][3]; eskf_nav_rotation_matrix(f,R);
+    float pred_body[3]={0.0f,0.0f,0.0f};
+    for(int axis=0;axis<3;axis++) for(int w=0;w<3;w++) pred_body[axis]+=R[w][axis]*f->velocity[w];
+    for(int axis=0;axis<3;axis++) if(axis_mask&(1U<<axis)) {
+        if(!isfinite(velocity_body[axis])||fabsf(velocity_body[axis])>AID_WORLD_VEL_MAX_MPS ||
+           fabsf(velocity_body[axis]-pred_body[axis])>AID_WHEEL_INNOV_MAX_MPS) return 0;
+    }
+
+    int requested=0,fused=0;
+    for(int axis=0;axis<3;axis++){
+        if((axis_mask&(1U<<axis))==0U)continue;
+        requested++;
+        /* Right-error q_true=q_nom⊗dq:
+         * δ(R^T v) = skew(v_body) δtheta + R^T δv. */
+        float sv[3][3]; skew(pred_body,sv);
+        uint8_t hi[6]={IDX_TH,IDX_TH+1,IDX_TH+2,IDX_V,IDX_V+1,IDX_V+2};
+        float hv[6]={sv[axis][0],sv[axis][1],sv[axis][2],
+                     R[0][axis],R[1][axis],R[2][axis]};
+        if(update1_sparse(f,hi,hv,6U,velocity_body[axis]-pred_body[axis],
+                          sigma*sigma,9.0f,0,2U,2U))fused++;
+    }
+    return requested>0 && fused==requested;
+}
+
+int eskf_nav_fuse_yaw(EskfNav *f,float yaw_rad,float sigma)
+{
+    if(!f||!isfinite(yaw_rad)||!isfinite(sigma)||
+       sigma<AID_SIGMA_YAW_MIN_RAD||sigma>AID_SIGMA_YAW_MAX_RAD)return 0;
+    float current=0.0f; eskf_nav_get_euler_rad(f,0,0,&current);
+    float gbody[3]; gravity_body(f,gbody);
+    const uint8_t hi[3]={IDX_TH,IDX_TH+1,IDX_TH+2};
+    float innov=wrap_pi(yaw_rad-current);
+    if(fabsf(innov)>AID_YAW_INNOV_MAX_RAD)return 0;
+    return update1_sparse(f,hi,gbody,3U,innov,sigma*sigma,AID_YAW_NIS_GATE,0,0U,0U);
+}
+
+static void reset_state_covariance_block(EskfNav *f,int start,float variance)
+{
+    variance=clampf_local(variance,1e-8f,1e4f);
+    for(int i=0;i<3;i++){
+        int idx=start+i;
+        for(int j=0;j<ESKF_NAV_DIM;j++){f->P[idx][j]=0.0f;f->P[j][idx]=0.0f;}
+        f->P[idx][idx]=variance;
+    }
+}
+
+void eskf_nav_inflate_velocity_uncertainty(EskfNav *f,float sigma_prior)
+{
+    if(!f||!isfinite(sigma_prior)||sigma_prior<=0.0f)return;
+    float v=sigma_prior*sigma_prior;
+    for(int i=0;i<3;i++)if(f->P[IDX_V+i][IDX_V+i]<v)f->P[IDX_V+i][IDX_V+i]=v;
+}
+
+int eskf_nav_reset_world_velocity(EskfNav *f,const float velocity[3],float sigma)
+{
+    if(!f||!velocity||!isfinite(sigma)||sigma<AID_SIGMA_VEL_MIN_MPS||sigma>AID_SIGMA_VEL_MAX_MPS)return 0;
+    for(int i=0;i<3;i++)if(!isfinite(velocity[i])||fabsf(velocity[i])>AID_WORLD_VEL_MAX_MPS)return 0;
+    memcpy(f->velocity,velocity,sizeof(f->velocity));
+    reset_state_covariance_block(f,IDX_V,sigma*sigma);
+    return 1;
+}
+
+int eskf_nav_reset_world_position(EskfNav *f,const float position[3],float sigma)
+{
+    if(!f||!position||!isfinite(sigma)||sigma<AID_SIGMA_POS_MIN_M||sigma>AID_SIGMA_POS_MAX_M)return 0;
+    for(int i=0;i<3;i++)if(!isfinite(position[i])||fabsf(position[i])>AID_WORLD_POS_MAX_M)return 0;
+    memcpy(f->position,position,sizeof(f->position));
+    reset_state_covariance_block(f,IDX_P,sigma*sigma);
+    return 1;
+}
+
+int eskf_nav_reset_yaw(EskfNav *f,float yaw,float sigma)
+{
+    if(!f||!isfinite(yaw)||!isfinite(sigma)||sigma<AID_SIGMA_YAW_MIN_RAD||sigma>AID_SIGMA_YAW_MAX_RAD)return 0;
+    float roll=0.0f,pitch=0.0f;eskf_nav_get_euler_rad(f,&roll,&pitch,0);
+    euler_to_quat(roll,pitch,wrap_pi(yaw),f->q);
+    /* Heading reset adalah source-initialization. Putuskan korelasi attitude lama
+     * agar covariance/bias historis tidak menyeret reset heading ke state lain. */
+    float old0=f->P[IDX_TH][IDX_TH],old1=f->P[IDX_TH+1][IDX_TH+1];
+    reset_state_covariance_block(f,IDX_TH,sigma*sigma);
+    if(old0>f->P[IDX_TH][IDX_TH])f->P[IDX_TH][IDX_TH]=old0;
+    if(old1>f->P[IDX_TH+1][IDX_TH+1])f->P[IDX_TH+1][IDX_TH+1]=old1;
+    return 1;
+}
+
+void eskf_nav_get_std(const EskfNav *f,float att[3],float vel[3],float pos[3])
+{
+    if(!f)return;
+    for(int i=0;i<3;i++){
+        if(att)att[i]=sqrtf(fmaxf(f->P[IDX_TH+i][IDX_TH+i],0.0f));
+        if(vel)vel[i]=sqrtf(fmaxf(f->P[IDX_V+i][IDX_V+i],0.0f));
+        if(pos)pos[i]=sqrtf(fmaxf(f->P[IDX_P+i][IDX_P+i],0.0f));
+    }
+}
+
+int eskf_nav_is_healthy(const EskfNav *f)
+{
+    if(!f||!f->initialized)return 0;
+    float qn=0.0f;
+    for(int i=0;i<4;i++){if(!isfinite(f->q[i]))return 0;qn+=f->q[i]*f->q[i];}
+    if(qn<0.8f||qn>1.2f)return 0;
+    for(int i=0;i<3;i++){
+        if(!isfinite(f->velocity[i])||fabsf(f->velocity[i])>ESKF_HEALTH_VELOCITY_MAX_MPS)return 0;
+        if(!isfinite(f->position[i])||fabsf(f->position[i])>ESKF_HEALTH_POSITION_MAX_M)return 0;
+        if(!isfinite(f->gyro_bias[i])||fabsf(f->gyro_bias[i])>ESKF_GYRO_BIAS_LIMIT_RAD*1.01f)return 0;
+        if(!isfinite(f->accel_bias[i])||fabsf(f->accel_bias[i])>ESKF_ACCEL_BIAS_LIMIT_MPS2*1.01f)return 0;
+    }
+    for(int r=0;r<ESKF_NAV_DIM;r++)for(int c=0;c<ESKF_NAV_DIM;c++){
+        if(!isfinite(f->P[r][c]))return 0;
+    }
+    for(int i=0;i<ESKF_NAV_DIM;i++)if(f->P[i][i]<1e-10f||f->P[i][i]>1e6f)return 0;
+    return 1;
 }
 
 void eskf_nav_get_euler_rad(const EskfNav *f,float *roll,float *pitch,float *yaw) {

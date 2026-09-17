@@ -37,6 +37,18 @@ void eskf_nav_predict_delta(EskfNav *f, const float delta_angle[3],
 int eskf_nav_correct_gravity(EskfNav *f, const float accel_mps2[3], int stationary);
 int eskf_nav_fuse_zero_velocity(EskfNav *f, float sigma_mps);
 int eskf_nav_fuse_zero_rate(EskfNav *f, const float gyro_rads[3], float sigma_rads);
+int eskf_nav_fuse_world_velocity(EskfNav *f, const float velocity_mps[3], float sigma_mps);
+int eskf_nav_fuse_world_position(EskfNav *f, const float position_m[3], float sigma_m);
+int eskf_nav_fuse_body_velocity(EskfNav *f, const float velocity_body_mps[3],
+                                uint8_t axis_mask, float sigma_mps);
+int eskf_nav_fuse_yaw(EskfNav *f, float yaw_rad, float sigma_rad);
+int eskf_nav_reset_world_velocity(EskfNav *f, const float velocity_mps[3], float sigma_mps);
+int eskf_nav_reset_world_position(EskfNav *f, const float position_m[3], float sigma_m);
+int eskf_nav_reset_yaw(EskfNav *f, float yaw_rad, float sigma_rad);
+void eskf_nav_inflate_velocity_uncertainty(EskfNav *f, float sigma_prior_mps);
+void eskf_nav_get_std(const EskfNav *f, float attitude_rad[3],
+                      float velocity_mps[3], float position_m[3]);
+int eskf_nav_is_healthy(const EskfNav *f);
 void eskf_nav_get_euler_rad(const EskfNav *f, float *roll, float *pitch, float *yaw);
 void eskf_nav_get_euler_deg(const EskfNav *f, float *roll, float *pitch, float *yaw);
 void eskf_nav_rotation_matrix(const EskfNav *f, float R[3][3]);

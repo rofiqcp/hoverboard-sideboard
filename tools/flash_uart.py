@@ -12,6 +12,7 @@ import time
 from pathlib import Path
 
 import serial
+from serial_common import find_sideboard_port, open_sideboard_port
 
 CMD_ENTER_BOOT = 0xF1
 CMD_INFO = 0xF8
@@ -19,7 +20,7 @@ CMD_ERASE = 0xF9
 CMD_WRITE = 0xFA
 CMD_GO = 0xFB
 CMD_VERIFY = 0xFC
-DEFAULT_PORT = "/dev/serial/by-id/usb-1a86_USB_Serial-if00-port0"
+DEFAULT_PORT = "auto"
 DEFAULT_BAUD = 921600
 
 
@@ -181,8 +182,9 @@ def main():
     image = path.read_bytes()
 
     try:
-        with serial.Serial(args.port, args.baud, timeout=0.03) as port:
-            print(f"Mencari bootloader di {args.port} @ {args.baud} baud ...")
+        selected_port = find_sideboard_port(args.port)
+        with open_sideboard_port(selected_port, args.baud, timeout=0.03) as port:
+            print(f"Mencari bootloader di {selected_port} @ {args.baud} baud ...")
             try:
                 info = catch_bootloader(port, 0.5)
                 print("Bootloader sudah aktif.")

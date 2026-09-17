@@ -96,7 +96,9 @@ pio run -e APP_STLINK -t upload
 
 ## Catatan pengujian hardware saat implementasi
 
-I2C telah terbukti mendeteksi satu perangkat di `0x68` dengan `WHO_AM_I=0x72`. Raw accel, gyro, suhu, serta ESKF sudah berjalan pada board nyata. Saat pengujian terakhir, CH340 terdeteksi Linux sebagai `/dev/ttyUSB0`, tetapi byte dari CH340 tidak masuk ke USART1 maupun USART2 MCU dan data MCU juga tidak diterima CH340. Artinya kabel TX/RX fisik ke adapter perlu diperiksa; firmware USART2 sendiri berjalan dan fungsi transmit melaporkan sukses.
+I2C telah terbukti mendeteksi perangkat `0x68` dengan `WHO_AM_I=0x72`. Raw accel/gyro/suhu, FIFO 200 Hz, ESKF, native VESC IMU, serta upload aplikasi melalui USART2 921600 sudah diuji langsung pada board. CH340 normalnya muncul sebagai `/dev/serial/by-id/usb-1a86_USB_Serial-if00-port0` atau `/dev/ttyUSB0`.
+
+Pada sesi Tahap 2 pernah terjadi USB hub host error Linux `-71` yang memutus seluruh downstream hub (CH340 ikut hilang sementara ST-LINK kemudian enumerate kembali). Itu adalah fault link/hub host, bukan ESKF/UART firmware. Tool host sekarang melakukan retry-open untuk transien serial, tetapi perangkat yang benar-benar hilang dari USB tetap perlu dipulihkan di level hub/kabel/power.
 
 ## Upload firmware melalui USART
 
@@ -145,7 +147,7 @@ python3 tools/calibrate_imu.py status
 pio run -e APP_USART -t upload
 ```
 
-Kalibrasi enam sisi bukan sekadar diputar terus. Tahan board stabil pada tiap orientasi sampai coverage sisi tersebut selesai. Firmware memakai rata-rata sampel stabil per sisi, menghitung offset/scale, memeriksa RMS dan error maksimum, lalu baru menyimpan ke EEPROM jika semua syarat lolos.
+Kalibrasi enam sisi bukan sekadar diputar terus. Tahan board stabil pada tiap orientasi sampai coverage sisi tersebut selesai. Firmware memakai rata-rata sampel stabil per sisi, menghitung offset + transform matrix 3x3, memeriksa RMS dan error maksimum, lalu baru menyimpan ke EEPROM jika semua syarat lolos.
 
 Saat master benar-benar mengetahui AGV berhenti, kirim `stationary-on`; saat mulai bergerak kirim `stationary-off`. Ini mengizinkan ZUPT/zero-rate membantu velocity, position, dan gyro-bias. Jangan mempertahankan stationary saat kendaraan bergerak konstan.
 
@@ -179,3 +181,43 @@ Catatan penting:
 - Startup ZUPT dilepas hanya setelah motion persisten; master `stationary-off` melepasnya deterministik sebelum AGV bergerak.
 - Yaw tetap relative tanpa heading aiding eksternal.
 - Position/velocity IMU-only tetap dead-reckoning; Tahap 2 perlu wheel odometry / external aiding untuk bounded navigation saat kendaraan bergerak.
+
+## Tahap 2 navigation aiding + calibration v4 (2026-09-17)
+
+EEPROM sekarang schema `IMU4` dan otomatis migrasi dari `IMU3`. Field baru meliputi full accelerometer transform 3x3, quaternion `sensor_to_body`, gyro/accel thermal slope, dan IMU lever-arm terhadap body origin. Loader memvalidasi CRC, finite/range seluruh parameter kritis, determinant matrix, dan quaternion.
+
+Alur kalibrasi accelerometer enam sisi sekarang memakai model `a_corrected = T * (a_raw - offset)`. Enam centroid +X/-X/+Y/-Y/+Z/-Z membentuk matrix sensor 3x3, kemudian firmware menghitung inverse matrix dan memeriksa RMS/max residual sebelum transactional commit. Runtime hanya 9 multiply per sampel.
+
+Command konfigurasi privat tetap memakai framing+CRC VESC:
+
+```bash
+python3 tools/configure_imu.py get
+python3 tools/configure_imu.py mount-rpy ROLL PITCH YAW
+python3 tools/configure_imu.py lever X Y Z
+python3 tools/configure_imu.py thermal GX GY GZ AX AY AZ
+python3 tools/configure_imu.py clear-thermal
+python3 tools/configure_imu.py reset-mount
+```
+
+External aiding menggunakan command `0xF4`, timestamp MCU opsional, sigma measurement, absolute input/range guards, innovation/NIS gate, dan source reacquisition reset. Contoh:
+
+```bash
+python3 tools/aiding_imu.py wheel 1.0 --sigma 0.05 --nhc
+python3 tools/aiding_imu.py world-vel 1.0 0.0 0.0 --sigma 0.10
+python3 tools/aiding_imu.py world-pos 2.0 1.0 0.0 --sigma 0.25
+python3 tools/aiding_imu.py yaw 90 --sigma 2
+```
+
+Wheel aiding mengobservasi body-forward velocity; NHC menahan body lateral/vertical velocity. Lever arm memakai koreksi `omega x r`. World velocity, world position, dan yaw memakai source reset ketika pertama acquire/ketika source timeout, lalu innovation fusion normal sesudah lock. Ini mencegah estimator menolak heading/velocity awal yang jauh dari state IMU-only.
+
+Protocol extended v4 menambahkan navigation validity/covariance status dan health-reset counter. Tanpa external aiding, status menunjukkan attitude valid + dead-reckoning + covariance valid. Native `COMM_GET_IMU_DATA=65` tetap kompatibel dan tidak berubah.
+
+Safety ESKF Tahap 2 mencakup finite/range guards, absolute innovation guards, NIS gates, bounded correction step, realistic gyro/accel residual-bias limits, covariance/state health check, serta automatic estimator recovery bila state menjadi non-finite/tidak sehat. Yaw aiding tidak diizinkan menyeret gyro-bias residual hingga batas.
+
+Regression host dapat dijalankan tanpa board:
+
+```bash
+./tools/run_host_math_tests.sh
+```
+
+Test tersebut memakai source C firmware yang sama untuk stationary propagation, yaw/velocity/position source reset, extreme measurement rejection, full 3x3 six-face calibration, dan transactional failure.

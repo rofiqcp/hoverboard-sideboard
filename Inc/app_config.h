@@ -68,14 +68,42 @@
 #define ROTATE_CAL_MAX_ERROR_G                0.10f
 #define ZUPT_SIGMA_MPS                      0.03f
 #define ZERO_RATE_SIGMA_RAD                 0.008f
+#define NHC_SIGMA_MPS                         0.05f
+#define AID_MAX_AGE_US                      200000UL
+#define AID_STATUS_TIMEOUT_US               500000UL
+#define AID_WHEEL_MAX_MPS                      15.0f
+#define AID_WORLD_VEL_MAX_MPS                  30.0f
+#define AID_WORLD_POS_MAX_M                 100000.0f
+#define AID_SIGMA_VEL_MIN_MPS                   0.01f
+#define AID_SIGMA_VEL_MAX_MPS                   10.0f
+#define AID_SIGMA_POS_MIN_M                     0.02f
+#define AID_SIGMA_POS_MAX_M                    100.0f
+#define AID_SIGMA_YAW_MIN_RAD                   0.005f
+#define AID_SIGMA_YAW_MAX_RAD                   1.0f
+#define AID_WHEEL_INNOV_MAX_MPS                 3.0f
+#define AID_WORLD_VEL_INNOV_MAX_MPS            10.0f
+#define AID_WORLD_POS_INNOV_MAX_M              50.0f
+#define AID_YAW_INNOV_MAX_RAD                   1.04719755f
+#define AID_YAW_NIS_GATE                         36.0f
+#define ESKF_GYRO_BIAS_LIMIT_RAD                0.05f
+#define ESKF_ACCEL_BIAS_LIMIT_MPS2              1.5f
+#define ESKF_GYRO_BIAS_STEP_MAX_RAD             0.003f
+#define ESKF_ACCEL_BIAS_STEP_MAX_MPS2           0.10f
+#define ESKF_ATTITUDE_STEP_MAX_RAD               0.25f
+#define ESKF_VELOCITY_STEP_MAX_MPS               5.0f
+#define ESKF_POSITION_STEP_MAX_M                25.0f
+#define ESKF_HEALTH_VELOCITY_MAX_MPS           100.0f
+#define ESKF_HEALTH_POSITION_MAX_M          1000000.0f
 
 /* ID payload privat di dalam framing VESC. Framing dan CRC tetap kompatibel VESC. */
 #define COMM_SIDEBOARD_IMU             0xF0U
 #define COMM_SIDEBOARD_BOOTLOADER      0xF1U
 #define COMM_SIDEBOARD_CALIBRATION     0xF2U
+#define COMM_SIDEBOARD_CONFIG          0xF3U
+#define COMM_SIDEBOARD_AIDING          0xF4U
 #define COMM_GET_IMU_DATA              65U
 #define BOOTLOADER_REQUEST_MAGIC       0xB007U
-#define IMU_PROTOCOL_VERSION           2U
+#define IMU_PROTOCOL_VERSION           4U
 
 /* Flag telemetry supaya host tahu kualitas data. */
 #define IMU_FLAG_SENSOR_OK             (1U << 0)
@@ -83,12 +111,17 @@
 #define IMU_FLAG_ACCEL_FUSED           (1U << 2)
 #define IMU_FLAG_EEPROM_VALID          (1U << 3)
 #define IMU_FLAG_STARTUP_STILL         (1U << 4)
-/* Bit 5 sengaja selalu 0: yaw MPU6xxx tidak absolut tanpa magnetometer/GNSS. */
+/* Bit 5 aktif hanya saat external yaw aid fresh; MPU6xxx sendiri tidak memberi yaw absolut. */
 #define IMU_FLAG_YAW_ABSOLUTE          (1U << 5)
 #define IMU_FLAG_STILL_CAL_VALID       (1U << 6)
 #define IMU_FLAG_ROTATE_CAL_VALID      (1U << 7)
 #define IMU_FLAG_CAL_ACTIVE            (1U << 8)
 #define IMU_FLAG_ZUPT_APPLIED          (1U << 9)
 #define IMU_FLAG_MASTER_STATIONARY     (1U << 10)
+#define IMU_FLAG_WHEEL_AID              (1U << 11)
+#define IMU_FLAG_NHC_AID                (1U << 12)
+#define IMU_FLAG_YAW_AID                (1U << 13)
+#define IMU_FLAG_VEL_AID                (1U << 14)
+#define IMU_FLAG_POS_AID                (1U << 15)
 
 #endif

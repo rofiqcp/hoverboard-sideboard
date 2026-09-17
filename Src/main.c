@@ -27,6 +27,35 @@ typedef struct {
     ImuSample last_sample;
 } StartupMeasurement;
 
+typedef struct {
+    uint32_t last_any_us, last_wheel_us, last_nhc_us;
+    uint32_t last_yaw_us, last_vel_us, last_pos_us;
+    uint32_t reject_count;
+} ExternalAidStatus;
+
+static volatile uint32_t filter_health_reset_count = 0U;
+
+static void rpy_to_quat(float roll,float pitch,float yaw,float q[4])
+{
+    float cr=cosf(0.5f*roll),sr=sinf(0.5f*roll);
+    float cp=cosf(0.5f*pitch),sp=sinf(0.5f*pitch);
+    float cy=cosf(0.5f*yaw),sy=sinf(0.5f*yaw);
+    q[0]=cr*cp*cy+sr*sp*sy; q[1]=sr*cp*cy-cr*sp*sy;
+    q[2]=cr*sp*cy+sr*cp*sy; q[3]=cr*cp*sy-sr*sp*cy;
+    float n=sqrtf(q[0]*q[0]+q[1]*q[1]+q[2]*q[2]+q[3]*q[3]);
+    if(n>1e-6f)for(int i=0;i<4;i++)q[i]/=n;
+}
+
+static uint32_t aid_age_us(uint32_t now_us,uint32_t stamp_us)
+{
+    return stamp_us==0U ? 0U : (uint32_t)(now_us-stamp_us);
+}
+
+static int aid_recent(uint32_t now_us,uint32_t last_us)
+{
+    return last_us!=0U && (uint32_t)(now_us-last_us)<=AID_STATUS_TIMEOUT_US;
+}
+
 static void service_bootloader_while_starting(void)
 {
     VescImuState empty_state;
@@ -138,6 +167,24 @@ static void init_filter(EskfNav *eskf,
     eskf->accel_dir_noise = settings->accel_dir_noise;
 }
 
+static int recover_filter_if_unhealthy(EskfNav *eskf,
+                                      const ImuSample *raw,
+                                      const PersistedSettings *settings,
+                                      ImuPreintegrator *preintegrator,
+                                      uint32_t *last_fifo_resync,
+                                      uint8_t sample_is_still,
+                                      uint8_t *startup_zupt)
+{
+    if (eskf_nav_is_healthy(eskf)) return 0;
+    filter_health_reset_count++;
+    init_filter(eskf,raw,settings);
+    imu_preintegrator_init(preintegrator);
+    (void)imu_mpu6xxx_fifo_reset();
+    if(last_fifo_resync)*last_fifo_resync=imu_mpu6xxx_get_fifo_stats()->fifo_resync_count;
+    if(startup_zupt)*startup_zupt=sample_is_still?1U:0U;
+    return 1;
+}
+
 typedef struct {
     uint16_t enter_count;
     uint8_t exit_count;
@@ -217,7 +264,8 @@ static void fill_telemetry(VescImuState *out,
                            int eeprom_valid,
                            int startup_stationary,
                            int zupt_applied,
-                           int master_stationary)
+                           int master_stationary,
+                           const ExternalAidStatus *aid)
 {
     memset(out, 0, sizeof(*out));
     out->sequence = sequence;
@@ -265,6 +313,28 @@ static void fill_telemetry(VescImuState *out,
     if (master_stationary) {
         out->flags |= IMU_FLAG_MASTER_STATIONARY;
     }
+
+    eskf_nav_get_std(eskf,out->attitude_std_rad,out->velocity_std_mps,out->position_std_m);
+    out->aid_age_ms=65535U;
+    if(aid){
+        uint32_t best=0xFFFFFFFFUL;
+        if(aid_recent(time_us,aid->last_wheel_us)){out->flags|=IMU_FLAG_WHEEL_AID;uint32_t a=time_us-aid->last_wheel_us;if(a<best)best=a;}
+        if(aid_recent(time_us,aid->last_nhc_us)){out->flags|=IMU_FLAG_NHC_AID;uint32_t a=time_us-aid->last_nhc_us;if(a<best)best=a;}
+        if(aid_recent(time_us,aid->last_yaw_us)){out->flags|=IMU_FLAG_YAW_AID|IMU_FLAG_YAW_ABSOLUTE;uint32_t a=time_us-aid->last_yaw_us;if(a<best)best=a;}
+        if(aid_recent(time_us,aid->last_vel_us)){out->flags|=IMU_FLAG_VEL_AID;uint32_t a=time_us-aid->last_vel_us;if(a<best)best=a;}
+        if(aid_recent(time_us,aid->last_pos_us)){out->flags|=IMU_FLAG_POS_AID;uint32_t a=time_us-aid->last_pos_us;if(a<best)best=a;}
+        if(best!=0xFFFFFFFFUL)out->aid_age_ms=(uint16_t)((best/1000U)>65535U?65535U:(best/1000U));
+        out->aid_reject_count=(uint16_t)(aid->reject_count>65535U?65535U:aid->reject_count);
+    }
+    out->nav_status=NAV_STATUS_ATT_VALID|NAV_STATUS_COV_VALID;
+    if(aid && (aid_recent(time_us,aid->last_wheel_us)||aid_recent(time_us,aid->last_vel_us)))
+        out->nav_status|=NAV_STATUS_VEL_AIDED;
+    if(aid && aid_recent(time_us,aid->last_pos_us))out->nav_status|=NAV_STATUS_POS_AIDED;
+    if(aid && aid_recent(time_us,aid->last_yaw_us))out->nav_status|=NAV_STATUS_YAW_AIDED;
+    if(!(out->nav_status&NAV_STATUS_POS_AIDED))out->nav_status|=NAV_STATUS_DEAD_RECKONING;
+    if(master_stationary)out->nav_status|=NAV_STATUS_STATIONARY_BOUND;
+    if(filter_health_reset_count>0U)out->nav_status|=NAV_STATUS_HEALTH_RECOVERED;
+    out->health_reset_count=(uint16_t)(filter_health_reset_count>65535U?65535U:filter_health_reset_count);
 }
 
 int main(void)
@@ -273,9 +343,14 @@ int main(void)
     wait_for_imu();
 
     PersistedSettings settings;
-    int eeprom_valid = eeprom_settings_load(&settings);
+    int settings_load_status = eeprom_settings_load(&settings);
+    int eeprom_valid = settings_load_status != 0;
     if (!eeprom_valid) {
         eeprom_settings_defaults(&settings);
+    } else if (settings_load_status == 2) {
+        /* Migrasi IMU3 -> IMU4 dipersist sekali. Semua bias/noise/counter lama
+         * dipertahankan, field Tahap 2 mendapat default identity/zero. */
+        eeprom_valid = eeprom_settings_save(&settings);
     }
 
     StartupMeasurement startup;
@@ -284,9 +359,16 @@ int main(void)
     /* Saat boot benar-benar diam, pakai bias gyro terbaru untuk sesi ini.
      * Jika EEPROM schema v2 belum pernah valid, simpan hasil pertama ini. */
     if (startup.stationary) {
+        float old_ref_temp=settings.calibration_temp_c;
+        float new_ref_temp=startup.temperature_avg;
+        float ref_shift=new_ref_temp-old_ref_temp;
         for (int i = 0; i < 3; i++) {
             settings.gyro_bias[i] = startup.gyro_avg[i];
+            /* Jika slope thermal pernah dikonfigurasi, pindahkan reference
+             * accel tanpa mengubah model koreksinya. */
+            settings.accel_offset[i] += settings.accel_temp_slope[i]*ref_shift;
         }
+        settings.calibration_temp_c=new_ref_temp;
         settings.calibration_flags |= CAL_FLAG_STILL_VALID;
 
         if (!eeprom_valid) {
@@ -368,6 +450,8 @@ int main(void)
     uint8_t telemetry_valid = 0U;
     VescImuState telemetry;
     memset(&telemetry, 0, sizeof(telemetry));
+    ExternalAidStatus aid_status;
+    memset(&aid_status,0,sizeof(aid_status));
 
     for (;;) {
         /* TIM2 menentukan cadence service. Jika CPU pernah terlambat, pending>1
@@ -427,6 +511,11 @@ int main(void)
         eskf_nav_predict_delta(&eskf, delta.delta_angle, delta.delta_velocity, delta.dt);
 
         int sample_is_still = stillness_update(&stillness, accel, gyro);
+        if(recover_filter_if_unhealthy(&eskf,&raw,&settings,&preintegrator,
+                                      &last_fifo_resync,(uint8_t)sample_is_still,&startup_zupt)) {
+            aid_status.reject_count++;
+            continue;
+        }
         /* Gravity correction 50 Hz. Saat bergerak gate dibuat jauh lebih ketat
          * dan measurement-noise diperbesar agar percepatan AGV tidak dianggap tilt. */
         if (++gravity_divider >= 2U) {
@@ -485,7 +574,7 @@ int main(void)
             telemetry_due = 1U;
             fill_telemetry(&telemetry, &raw, accel, gyro, &eskf, &calibration,
                            &settings, sequence, now_us, gravity_ok, eeprom_valid,
-                           startup.stationary, zupt_applied, master_stationary);
+                           startup.stationary, zupt_applied, master_stationary,&aid_status);
             telemetry_valid = 1U;
         }
 
@@ -546,6 +635,95 @@ int main(void)
             master_stationary = 0U;
             startup_zupt = 0U;
             (void)vesc_send_calibration_status(&huart2, CAL_CMD_STATIONARY_OFF, 0U, &telemetry);
+        } else if (action == VESC_ACTION_CONFIG) {
+            VescConfigRequest req;
+            if(vesc_take_config_request(&req)){
+                int changed=0,reinit=0;
+                if(req.subcmd==CFG_CMD_SET_MOUNT_RPY){
+                    rpy_to_quat(req.value[0],req.value[1],req.value[2],settings.sensor_to_body_q);
+                    settings.calibration_flags|=CAL_FLAG_MOUNT_VALID; changed=1; reinit=1;
+                }else if(req.subcmd==CFG_CMD_RESET_MOUNT){
+                    settings.sensor_to_body_q[0]=1.0f; settings.sensor_to_body_q[1]=0.0f;
+                    settings.sensor_to_body_q[2]=0.0f; settings.sensor_to_body_q[3]=0.0f;
+                    settings.calibration_flags&=~CAL_FLAG_MOUNT_VALID; changed=1; reinit=1;
+                }else if(req.subcmd==CFG_CMD_SET_THERMAL){
+                    int valid=1; for(int i=0;i<3;i++)if(fabsf(req.value[i])>0.05f||fabsf(req.value[i+3])>1.0f)valid=0;
+                    if(valid){for(int i=0;i<3;i++){settings.gyro_temp_slope[i]=req.value[i];settings.accel_temp_slope[i]=req.value[i+3];}
+                        settings.calibration_flags|=CAL_FLAG_THERMAL_VALID; changed=1; reinit=1;}
+                    else {(void)vesc_send_config_status(&huart2,req.subcmd,2U,&settings);continue;}
+                }else if(req.subcmd==CFG_CMD_CLEAR_THERMAL){
+                    memset(settings.gyro_temp_slope,0,sizeof(settings.gyro_temp_slope));
+                    memset(settings.accel_temp_slope,0,sizeof(settings.accel_temp_slope));
+                    settings.calibration_flags&=~CAL_FLAG_THERMAL_VALID; changed=1; reinit=1;
+                }else if(req.subcmd==CFG_CMD_SET_LEVER_ARM){
+                    int valid=1;for(int i=0;i<3;i++)if(fabsf(req.value[i])>5.0f)valid=0;
+                    if(valid){memcpy(settings.imu_position_body,req.value,sizeof(settings.imu_position_body));changed=1;}
+                    else {(void)vesc_send_config_status(&huart2,req.subcmd,2U,&settings);continue;}
+                }
+                uint8_t status=0U;
+                if(changed){eeprom_valid=eeprom_settings_save(&settings);if(!eeprom_valid)status=1U;}
+                if(reinit && status==0U){
+                    imu_apply_static_calibration(&raw,&settings,accel,gyro); init_filter(&eskf,&raw,&settings);
+                    imu_preintegrator_init(&preintegrator); (void)imu_mpu6xxx_fifo_reset();
+                    last_fifo_resync=imu_mpu6xxx_get_fifo_stats()->fifo_resync_count;
+                    startup_zupt=sample_is_still?1U:0U;
+                }
+                (void)vesc_send_config_status(&huart2,req.subcmd,status,&settings);
+            }
+        } else if (action == VESC_ACTION_AIDING) {
+            VescAidingRequest req;
+            if(vesc_take_aiding_request(&req)){
+                uint32_t age=aid_age_us(now_us,req.time_us);
+                uint16_t age_ms=(uint16_t)((age/1000U)>65535U?65535U:(age/1000U));
+                uint8_t status=0U; int ok=0;
+                if(age>AID_MAX_AGE_US){status=4U;aid_status.reject_count++;}
+                else{
+                    float sigma=req.sigma*(1.0f+(float)age/(float)AID_MAX_AGE_US);
+                    if(req.type==AID_CMD_WHEEL_BODY_X){
+                        float omega[3],lever_cross[3],target[3]={req.value[0],0.0f,0.0f};
+                        if(!isfinite(req.value[0])||fabsf(req.value[0])>AID_WHEEL_MAX_MPS ||
+                           !isfinite(sigma)||sigma<AID_SIGMA_VEL_MIN_MPS||sigma>AID_SIGMA_VEL_MAX_MPS){
+                            ok=0;
+                        }else{
+                            for(int i=0;i<3;i++)omega[i]=gyro[i]-eskf.gyro_bias[i];
+                            lever_cross[0]=omega[1]*settings.imu_position_body[2]-omega[2]*settings.imu_position_body[1];
+                            lever_cross[1]=omega[2]*settings.imu_position_body[0]-omega[0]*settings.imu_position_body[2];
+                            lever_cross[2]=omega[0]*settings.imu_position_body[1]-omega[1]*settings.imu_position_body[0];
+                            for(int i=0;i<3;i++)target[i]+=lever_cross[i];
+                            if(!aid_recent(now_us,aid_status.last_wheel_us))
+                                eskf_nav_inflate_velocity_uncertainty(&eskf,1.0f);
+                            ok=eskf_nav_fuse_body_velocity(&eskf,target,0x01U,sigma);
+                            if(ok){aid_status.last_wheel_us=now_us;aid_status.last_any_us=now_us;}
+                            if(ok && (req.flags&AID_FLAG_NHC)){
+                                float nhc_sigma=NHC_SIGMA_MPS*(1.0f+(float)age/(float)AID_MAX_AGE_US);
+                                if(eskf_nav_fuse_body_velocity(&eskf,target,0x06U,nhc_sigma))aid_status.last_nhc_us=now_us;
+                            }
+                        }
+                    }else if(req.type==AID_CMD_WORLD_VELOCITY){
+                        if(!aid_recent(now_us,aid_status.last_vel_us))
+                            ok=eskf_nav_reset_world_velocity(&eskf,req.value,sigma);
+                        else ok=eskf_nav_fuse_world_velocity(&eskf,req.value,sigma);
+                        if(ok){aid_status.last_vel_us=now_us;aid_status.last_any_us=now_us;}
+                    }else if(req.type==AID_CMD_WORLD_POSITION){
+                        if(!aid_recent(now_us,aid_status.last_pos_us))
+                            ok=eskf_nav_reset_world_position(&eskf,req.value,sigma);
+                        else ok=eskf_nav_fuse_world_position(&eskf,req.value,sigma);
+                        if(ok){aid_status.last_pos_us=now_us;aid_status.last_any_us=now_us;}
+                    }else if(req.type==AID_CMD_YAW){
+                        if(!aid_recent(now_us,aid_status.last_yaw_us))
+                            ok=eskf_nav_reset_yaw(&eskf,req.value[0],sigma);
+                        else ok=eskf_nav_fuse_yaw(&eskf,req.value[0],sigma);
+                        if(ok){aid_status.last_yaw_us=now_us;aid_status.last_any_us=now_us;}
+                    }
+                    if(!ok){status=1U;aid_status.reject_count++;}
+                    if(!eskf_nav_is_healthy(&eskf)) {
+                        (void)recover_filter_if_unhealthy(&eskf,&raw,&settings,&preintegrator,
+                                                         &last_fifo_resync,(uint8_t)sample_is_still,&startup_zupt);
+                        status=5U; aid_status.reject_count++;
+                    }
+                }
+                (void)vesc_send_aiding_status(&huart2,req.type,status,age_ms);
+            }
         }
 
         if (telemetry_due) {

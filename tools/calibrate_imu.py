@@ -11,7 +11,7 @@ import time
 
 import serial
 from read_imu import crc16, read_frame, decode_imu, flag_text
-from serial_common import find_sideboard_port
+from serial_common import find_sideboard_port, open_sideboard_port
 
 BAUD_DEFAULT = 921600
 COMM_CAL = 0xF2
@@ -175,7 +175,7 @@ def main():
 
     port_name = find_sideboard_port(args.port)
     print(f"Sideboard: {port_name} @ {args.baud} baud")
-    with serial.Serial(port_name, args.baud, timeout=0.03) as port:
+    with open_sideboard_port(port_name, args.baud, timeout=0.03) as port:
         port.reset_input_buffer()
         if args.command == "monitor":
             return interactive(port, args.every)

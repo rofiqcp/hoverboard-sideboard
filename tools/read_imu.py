@@ -9,7 +9,7 @@ import argparse
 import struct
 import time
 import serial
-from serial_common import find_sideboard_port
+from serial_common import find_sideboard_port, open_sideboard_port
 
 PORT_DEFAULT = "auto"
 BAUD_DEFAULT = 921600
@@ -64,10 +64,18 @@ def read_frame(port: serial.Serial):
 
 
 def decode_imu(payload: bytes):
-    """Ubah payload binary menjadi dictionary yang mudah dibaca manusia."""
-    if len(payload) != 79 or payload[0] != COMM_SIDEBOARD_IMU:
+    """Decode protocol v2 (79), v3 (101), dan v4 validity (104 byte)."""
+    if not payload or payload[0] != COMM_SIDEBOARD_IMU or len(payload) not in (79, 101, 104):
         return None
-    fields = struct.unpack(">BBHII7h12iBBBH", payload)
+    if len(payload) == 79:
+        fields = struct.unpack(">BBHII7h12iBBBH", payload)
+        extra = None
+    elif len(payload) == 101:
+        fields = struct.unpack(">BBHII7h12iBBB12H", payload)
+        extra = fields[28:39]
+    else:
+        fields = struct.unpack(">BBHII7h12iBBB12HBH", payload)
+        extra = fields[28:39]
     command, version, flags, seq, time_us = fields[:5]
     ax, ay, az, temp, gx, gy, gz = fields[5:12]
     roll_md, pitch_md, yaw_md = fields[12:15]
@@ -75,14 +83,26 @@ def decode_imu(payload: bytes):
     px,py,pz = fields[18:21]
     lax,lay,laz = fields[21:24]
     cal_state,coverage,cal_error,cal_progress = fields[24:28]
-    return {
+    data = {
         "command": command, "version": version, "flags": flags,
         "seq": seq, "time_us": time_us,
         "accel_raw": (ax, ay, az), "temp_raw": temp, "gyro_raw": (gx, gy, gz),
         "roll": roll_md / 1000.0, "pitch": pitch_md / 1000.0, "yaw": yaw_md / 1000.0,
         "vel": (vx/1000.0,vy/1000.0,vz/1000.0), "pos": (px/1000.0,py/1000.0,pz/1000.0),
         "linacc": (lax/1000.0,lay/1000.0,laz/1000.0), "cal": (cal_state,coverage,cal_error,cal_progress),
+        "aid_age_ms": 65535, "aid_reject": 0,
+        "att_std_deg": (0.0,0.0,0.0), "vel_std": (0.0,0.0,0.0), "pos_std": (0.0,0.0,0.0),
+        "nav_status": 0, "health_resets": 0,
     }
+    if extra:
+        data["aid_age_ms"], data["aid_reject"] = extra[:2]
+        data["att_std_deg"] = tuple(x/1000.0 for x in extra[2:5])
+        data["vel_std"] = tuple(x/1000.0 for x in extra[5:8])
+        data["pos_std"] = tuple(x/1000.0 for x in extra[8:11])
+    if len(payload) == 104:
+        data["nav_status"] = fields[39]
+        data["health_resets"] = fields[40]
+    return data
 
 def flag_text(flags: int) -> str:
     """Terjemahkan bit status firmware ke tulisan ringkas bahasa Indonesia."""
@@ -99,6 +119,24 @@ def flag_text(flags: int) -> str:
     if flags & (1 << 8): names.append("cal_active")
     if flags & (1 << 9): names.append("zupt")
     if flags & (1 << 10): names.append("master_stationary")
+    if flags & (1 << 11): names.append("wheel_aid")
+    if flags & (1 << 12): names.append("nhc")
+    if flags & (1 << 13): names.append("yaw_aid")
+    if flags & (1 << 14): names.append("vel_aid")
+    if flags & (1 << 15): names.append("pos_aid")
+    return ",".join(names)
+
+
+def nav_text(status: int) -> str:
+    names=[]
+    if status & 1: names.append("att_valid")
+    if status & 2: names.append("vel_aided")
+    if status & 4: names.append("pos_aided")
+    if status & 8: names.append("yaw_aided")
+    if status & 16: names.append("dead_reckoning")
+    if status & 32: names.append("cov_valid")
+    if status & 64: names.append("stationary_bound")
+    if status & 128: names.append("health_recovered")
     return ",".join(names)
 
 
@@ -120,7 +158,7 @@ def main():
     started = time.monotonic()
 
     selected_port = find_sideboard_port(args.port)
-    with serial.Serial(selected_port, args.baud, timeout=0.05) as port:
+    with open_sideboard_port(selected_port, args.baud, timeout=0.05) as port:
         port.reset_input_buffer()
         print(f"Membaca {selected_port} @ {args.baud} baud ...")
         try:
@@ -159,7 +197,10 @@ def main():
                         f"G[dps]=({gd[0]:+.2f},{gd[1]:+.2f},{gd[2]:+.2f}) "
                         f"V=({data['vel'][0]:+.3f},{data['vel'][1]:+.3f},{data['vel'][2]:+.3f})m/s "
                         f"P=({data['pos'][0]:+.3f},{data['pos'][1]:+.3f},{data['pos'][2]:+.3f})m "
-                        f"T={temp_c:.2f}C flags=0x{data['flags']:04X} [{flag_text(data['flags'])}]"
+                        f"stdV=({data['vel_std'][0]:.3f},{data['vel_std'][1]:.3f},{data['vel_std'][2]:.3f}) "
+                        f"aid_age={data['aid_age_ms']}ms rej={data['aid_reject']} "
+                        f"T={temp_c:.2f}C flags=0x{data['flags']:04X} [{flag_text(data['flags'])}] "
+                        f"nav=0x{data['nav_status']:02X}[{nav_text(data['nav_status'])}] resets={data['health_resets']}"
                     )
         except KeyboardInterrupt:
             pass

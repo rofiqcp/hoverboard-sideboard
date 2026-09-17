@@ -5,6 +5,8 @@
 
 #define CAL_FLAG_STILL_VALID   (1UL << 0)
 #define CAL_FLAG_ROTATE_VALID  (1UL << 1)
+#define CAL_FLAG_MOUNT_VALID   (1UL << 2)
+#define CAL_FLAG_THERMAL_VALID (1UL << 3)
 
 typedef struct {
     uint32_t magic;
@@ -12,7 +14,11 @@ typedef struct {
     uint16_t length;
     float gyro_bias[3];
     float accel_offset[3];
-    float accel_scale[3];
+    float accel_transform[9];       /* row-major: a_corr = T * (a_raw-offset). */
+    float sensor_to_body_q[4];      /* quaternion sensor -> body, wxyz. */
+    float gyro_temp_slope[3];       /* rad/s/degC relative calibration_temp_c. */
+    float accel_temp_slope[3];      /* m/s^2/degC before accel transform. */
+    float imu_position_body[3];     /* IMU lever arm from body origin, meter. */
     float gyro_noise;
     float accel_process_noise;
     float gyro_bias_walk;
