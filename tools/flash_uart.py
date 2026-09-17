@@ -14,6 +14,12 @@ from pathlib import Path
 import serial
 from serial_common import find_sideboard_port, open_sideboard_port
 
+try:
+    sys.stdout.reconfigure(line_buffering=True)
+    sys.stderr.reconfigure(line_buffering=True)
+except Exception:
+    pass
+
 CMD_ENTER_BOOT = 0xF1
 CMD_INFO = 0xF8
 CMD_ERASE = 0xF9
@@ -51,24 +57,50 @@ def read_exact(port: serial.Serial, size: int, timeout: float) -> bytes:
     return bytes(out)
 
 
+def _rx_buffer(port):
+    b = getattr(port, "_vesc_rx_buffer", None)
+    if b is None:
+        b = bytearray()
+        setattr(port, "_vesc_rx_buffer", b)
+    return b
+
+
+def _clear_rx_buffer(port):
+    setattr(port, "_vesc_rx_buffer", bytearray())
+
+
 def read_packet(port: serial.Serial, timeout: float = 1.0):
-    """Cari satu frame VESC pendek yang CRC-nya valid."""
+    """Sliding resynchronizer VESC. Byte rusak hanya membuang 1 byte kandidat."""
+    buf = _rx_buffer(port)
     end = time.monotonic() + timeout
     while time.monotonic() < end:
-        b = port.read(1)
-        if not b or b[0] != 2:
-            continue
-        lb = read_exact(port, 1, 0.2)
-        if len(lb) != 1 or lb[0] == 0:
-            continue
-        n = lb[0]
-        rest = read_exact(port, n + 3, 0.5)
-        if len(rest) != n + 3:
-            continue
-        payload = rest[:n]
-        crc_rx = (rest[n] << 8) | rest[n + 1]
-        if rest[n + 2] == 3 and crc_rx == crc16(payload):
-            return payload
+        while True:
+            try:
+                start = buf.index(2)
+            except ValueError:
+                buf.clear(); break
+            if start:
+                del buf[:start]
+            if len(buf) < 2:
+                break
+            n = buf[1]
+            if n == 0:
+                del buf[0]; continue
+            total = n + 5
+            if len(buf) < total:
+                break
+            payload = bytes(buf[2:2+n])
+            crc_rx = (buf[2+n] << 8) | buf[3+n]
+            if buf[4+n] == 3 and crc_rx == crc16(payload):
+                del buf[:total]
+                return payload
+            del buf[0]
+        remaining = end - time.monotonic()
+        if remaining <= 0:
+            break
+        chunk = port.read(min(256, max(1, getattr(port, "in_waiting", 0) or 1)))
+        if chunk:
+            buf.extend(chunk)
     return None
 
 
@@ -82,6 +114,20 @@ def transact(port: serial.Serial, payload: bytes, expect_cmd: int, timeout: floa
         if reply and reply[0] == expect_cmd:
             return reply
     raise TimeoutError(f"Tidak ada reply command 0x{expect_cmd:02X}")
+
+
+def transact_retry(port, payload: bytes, expect_cmd: int, timeout: float, attempts: int = 3):
+    """Retry command bootloader yang idempotent bila ACK hilang tanpa USB disconnect."""
+    last = None
+    for _ in range(max(attempts, 1)):
+        try:
+            return transact(port, payload, expect_cmd, timeout)
+        except TimeoutError as exc:
+            last = exc
+            try: port.reset_input_buffer()
+            except Exception: pass
+            time.sleep(0.03)
+    raise last
 
 
 def request_bootloader_from_app(port: serial.Serial, seconds: float = 1.5) -> bool:
@@ -99,17 +145,21 @@ def request_bootloader_from_app(port: serial.Serial, seconds: float = 1.5) -> bo
 
 
 def catch_bootloader(port: serial.Serial, seconds: float = 3.0) -> bytes:
-    """Kirim INFO berulang agar command tertangkap pada jendela boot 800 ms."""
+    """Kirim INFO periodik; purge hanya sekali agar USB-UART tidak dibombardir ioctl."""
     end = time.monotonic() + seconds
-    while time.monotonic() < end:
+    try:
         port.reset_input_buffer()
+    except (serial.SerialException, OSError):
+        raise
+    _clear_rx_buffer(port)
+    while time.monotonic() < end:
         port.write(make_packet(bytes((CMD_INFO,))))
         port.flush()
-        reply = read_packet(port, 0.12)
+        reply = read_packet(port, 0.15)
         if reply and reply[0] == CMD_INFO:
             return reply
-        time.sleep(0.03)
-    raise TimeoutError("Bootloader tidak tertangkap. Reset/power-cycle board lalu coba lagi.")
+        time.sleep(0.04)
+    raise TimeoutError("Bootloader tidak menjawab INFO dalam deadline")
 
 
 def parse_info(reply: bytes):
@@ -125,9 +175,50 @@ def parse_info(reply: bytes):
     return version, app_start, app_end, page, chunk, app_valid
 
 
+def acquire_bootloader(requested, baud, handshake=4.0, overall=35.0):
+    """Dapatkan handle bootloader BARU dan serahkan ownership ke caller.
+
+    Port hanya ditutup pada jalur gagal. Setelah INFO sukses handle wajib tetap
+    terbuka untuk ERASE/WRITE/VERIFY/GO.
+    """
+    deadline = time.monotonic() + overall
+    last = None
+    attempt = 0
+    while time.monotonic() < deadline:
+        attempt += 1
+        port = None
+        try:
+            port = open_sideboard_port(requested, baud, timeout=0.03, attempts=2, delay=0.10)
+            name = port.port
+            try:
+                info = catch_bootloader(port, 0.55)
+                print(f"Bootloader terdeteksi pada {name} (acquire #{attempt}).")
+                return port, info
+            except TimeoutError:
+                try:
+                    ack = request_bootloader_from_app(port, 1.0)
+                    if ack:
+                        print(f"F1 ACK dari aplikasi pada {name}; reopen serial ...")
+                except (serial.SerialException, OSError) as exc:
+                    last = exc
+                try: port.close()
+                except Exception: pass
+                port = None
+        except (serial.SerialException, OSError, FileNotFoundError, TimeoutError) as exc:
+            last = exc
+            if port is not None:
+                try: port.close()
+                except Exception: pass
+                port = None
+        time.sleep(0.15)
+    raise TimeoutError(f"Tidak bisa acquire bootloader setelah reconnect: {last}")
+
+
 def flash_image(port: serial.Serial, image: bytes, info: bytes):
     """Erase, tulis image, lalu verifikasi CRC keseluruhan."""
     version, start, end, page, suggested_chunk, app_valid = parse_info(info)
+    if version < 3:
+        raise RuntimeError("Bootloader legacy v%d tidak punya manifest power-loss-safe; flash BOOTLOADER_STLINK v3 dulu" % version)
     if len(image) == 0 or len(image) > end - start:
         raise ValueError(f"Ukuran firmware {len(image)} byte di luar area aplikasi {end-start} byte")
 
@@ -137,7 +228,7 @@ def flash_image(port: serial.Serial, image: bytes, info: bytes):
     print(f"Bootloader v{version} | app 0x{start:08X}..0x{end-1:08X} | "
           f"page={page} | app_lama_valid={app_valid}")
     print("Menghapus area aplikasi ...")
-    r = transact(port, bytes((CMD_ERASE,)), CMD_ERASE, timeout=8.0)
+    r = transact_retry(port, bytes((CMD_ERASE,)), CMD_ERASE, timeout=8.0, attempts=2)
     if len(r) < 2 or r[1] != 0:
         raise RuntimeError("Erase gagal")
 
@@ -146,7 +237,7 @@ def flash_image(port: serial.Serial, image: bytes, info: bytes):
         data = image[off:off + chunk]
         addr = start + off
         payload = bytes((CMD_WRITE,)) + struct.pack(">I", addr) + data
-        r = transact(port, payload, CMD_WRITE, timeout=1.5)
+        r = transact_retry(port, payload, CMD_WRITE, timeout=1.5, attempts=3)
         if len(r) < 6 or r[1] != 0 or struct.unpack_from(">I", r, 2)[0] != addr:
             raise RuntimeError(f"Write gagal pada 0x{addr:08X}")
         done = min(off + len(data), total)
@@ -155,7 +246,7 @@ def flash_image(port: serial.Serial, image: bytes, info: bytes):
 
     image_crc = crc16(image)
     verify = bytes((CMD_VERIFY,)) + struct.pack(">I", total) + struct.pack(">H", image_crc)
-    r = transact(port, verify, CMD_VERIFY, timeout=2.0)
+    r = transact_retry(port, verify, CMD_VERIFY, timeout=2.0, attempts=2)
     if len(r) < 2 or r[1] != 0:
         raise RuntimeError(f"VERIFY CRC gagal (host CRC=0x{image_crc:04X})")
     print(f"VERIFY CRC OK: 0x{image_crc:04X}")
@@ -175,6 +266,8 @@ def main():
                         help="Lama mencoba menangkap bootloader setelah board di-reset")
     parser.add_argument("--retries", type=int, default=6,
                         help="Ulang sesi penuh bila USB putus saat enter/erase/write/verify")
+    parser.add_argument("--overall-timeout", type=float, default=90.0,
+                        help="Deadline global seluruh workflow; tidak pernah menunggu tanpa batas")
     args = parser.parse_args()
 
     path = Path(args.firmware)
@@ -184,38 +277,30 @@ def main():
     image = path.read_bytes()
 
     last = None
+    global_deadline = time.monotonic() + max(args.overall_timeout, 5.0)
     for attempt in range(1, max(args.retries, 1) + 1):
+        if time.monotonic() >= global_deadline:
+            last = TimeoutError("deadline global flash terlampaui")
+            break
+        port = None
         try:
-            # Port dicari ulang setiap sesi; ttyUSB/by-id boleh berubah setelah USB re-enumerate.
-            with open_sideboard_port(args.port, args.baud, timeout=0.03, attempts=150, delay=0.20) as port:
-                selected_port = port.port
-                print(f"Sesi flash {attempt}/{max(args.retries,1)} di {selected_port} @ {args.baud} baud ...")
-                try:
-                    info = catch_bootloader(port, 0.7)
-                    print("Bootloader sudah aktif.")
-                except TimeoutError:
-                    print("Aplikasi aktif; meminta reset ke bootloader lewat USART ...")
-                    try:
-                        app_ack = request_bootloader_from_app(port, 2.5)
-                    except (serial.SerialException, OSError):
-                        # USB boleh hilang tepat ketika MCU menerima F1. Sesi berikut akan
-                        # reconnect dan mencoba INFO; jangan menganggap F1 gagal.
-                        app_ack = False
-                        raise
-                    print("ACK aplikasi diterima." if app_ack else
-                          "ACK aplikasi tidak terlihat; tetap cari bootloader.")
-                    time.sleep(0.10)
-                    try: port.reset_input_buffer()
-                    except Exception: pass
-                    info = catch_bootloader(port, max(args.handshake, 2.0))
-                    print("Bootloader berhasil dimasuki tanpa ST-LINK.")
-                flash_image(port, image, info)
-                return 0
+            print(f"Acquire bootloader untuk sesi flash {attempt}/{max(args.retries,1)} ...")
+            remaining = max(2.0, global_deadline - time.monotonic())
+            port, info = acquire_bootloader(args.port, args.baud, args.handshake,
+                                            overall=min(12.0, remaining))
+            print(f"Sesi flash {attempt} memakai {port.port} @ {args.baud} baud")
+            flash_image(port, image, info)
+            try: port.close()
+            except Exception: pass
+            return 0
         except (serial.SerialException, OSError, FileNotFoundError, TimeoutError, RuntimeError) as exc:
             last = exc
+            if port is not None:
+                try: port.close()
+                except Exception: pass
             print(f"Sesi flash {attempt} terputus/gagal: {exc}", file=sys.stderr)
             if attempt < max(args.retries, 1):
-                print("Reconnect dan ulang ERASE+WRITE dari awal ...", file=sys.stderr)
+                print("Reconnect, acquire bootloader lagi, lalu ulang ERASE+WRITE dari awal ...", file=sys.stderr)
                 time.sleep(0.50)
                 continue
             break

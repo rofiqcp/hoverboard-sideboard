@@ -61,11 +61,12 @@ Page flash terakhir 1 KB dipakai sebagai EEPROM emulasi. Data dilindungi magic, 
 
 Peta flash:
 
-- `0x08000000..0x080017FF`: bootloader 6 KB;
-- `0x08001800..0x0800FBFF`: aplikasi 57 KB;
-- `0x0800FC00..0x0800FFFF`: EEPROM emulasi 1 KB.
+- `0x08000000..0x080017FF`: bootloader 6 KiB;
+- `0x08001800..0x0800F7FF`: aplikasi maksimum 56 KiB;
+- `0x0800F800..0x0800FBFF`: manifest/commit marker aplikasi 1 KiB;
+- `0x0800FC00..0x0800FFFF`: EEPROM emulasi 1 KiB.
 
-Area aplikasi berarti sekitar 89% dari total flash 64 KB tetap tersedia untuk firmware utama.
+Linker aplikasi berhenti tepat sebelum halaman manifest sehingga firmware tidak dapat menimpanya.
 
 ## Bootloader UART
 
@@ -83,7 +84,7 @@ Tool host:
 python3 tools/flash_uart.py .pio/build/APP_STLINK/firmware.bin
 ```
 
-Saat aplikasi lama masih berjalan, reset/power-cycle board agar tool dapat menangkap jendela bootloader sekitar 800 ms.
+Bootloader normal memberi jendela sekitar 1,5 detik setelah reset. Update melalui aplikasi tidak perlu reset manual: command `0xF1` menyimpan recovery latch di backup register lalu software-reset, sehingga bootloader tetap aktif sampai `GO` berhasil.
 
 ## Build dan flash ST-LINK
 
@@ -113,7 +114,7 @@ Dengan mekanisme ini update normal tidak memerlukan ST-LINK.
 
 ### RX USART yang robust
 
-USART2 RX memakai interrupt `RXNE` dan ring buffer 64 byte. Tujuannya agar command servis, termasuk `ENTER_BOOTLOADER`, tidak hilang ketika CPU sedang melakukan transmit telemetry. Pendekatan ini mengikuti prinsip firmware sideboard asli yang juga memakai penerimaan USART secara asinkron.
+USART2 RX memakai interrupt `RXNE` dan ring buffer 128 byte. Overflow dihitung, byte tertua dibuang, dan parser mereset frame parsial saat overflow/inter-byte timeout. Parser juga dapat resinkron setelah garbage atau frame terpotong. ACK/control memiliki prioritas terhadap telemetry async.
 
 Upload yang sudah diuji langsung:
 
@@ -122,6 +123,16 @@ pio run -e APP_USART -t upload
 ```
 
 Pengujian dua upload berturut-turut berhasil: aplikasi masuk bootloader otomatis, erase, write, verifikasi CRC image penuh, lalu kembali menjalankan aplikasi tanpa reset manual dan tanpa ST-LINK.
+
+### Bootloader v3: recovery/power-loss safety
+
+Bootloader v3 memakai manifest commit marker terpisah. `ERASE` meng-invalidasi manifest **sebelum** menghapus aplikasi. `VERIFY` memeriksa CRC16 seluruh image, kemudian baru menulis manifest sebagai commit terakhir. Karena itu reset/listrik mati di tengah `WRITE` tidak pernah membuat image parsial dianggap valid. Setelah reset, bootloader tetap menunggu host sampai image lolos CRC dan `GO` diterima.
+
+Aplikasi dan bootloader menggunakan independent watchdog. Jika main-loop aplikasi benar-benar deadlock, watchdog mereset MCU; bootloader memberi recovery window lebih panjang setelah watchdog reset. Fatal `board_panic()` juga diarahkan ke bootloader, bukan hard-lock.
+
+Tool `flash_uart.py` mempunyai sliding frame resynchronizer, reconnect lintas USB re-enumeration, retry sesi penuh, port exclusive, dan deadline global. Jika ACK `WRITE`/`VERIFY` hilang atau USB putus, tool tidak mengasumsikan sukses: sesi berikutnya acquire bootloader lagi dan mengulang `ERASE -> WRITE -> VERIFY`.
+
+Fault injection yang sudah diuji langsung: frame parsial, 400-byte garbage burst, flood 100 command, 5 siklus `F1 -> INFO -> GO`, serta reset setelah hanya 1280 byte image ditulis. Pada test reset-mid-update, `INFO` setelah reset tetap melaporkan `app_valid=False`, kemudian full recovery 42868 byte berhasil dengan CRC `0xB251` dan `GO` tanpa reset manual.
 
 ## Pemakaian paling sederhana
 

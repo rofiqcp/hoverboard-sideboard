@@ -5,7 +5,8 @@
 
 /* Peta flash STM32F103C8 64 KB.
  * 0x08000000..0x080017FF : bootloader 6 KB
- * 0x08001800..0x0800FBFF : aplikasi 57 KB
+ * 0x08001800..0x0800F7FF : aplikasi 56 KB
+ * 0x0800F800..0x0800FBFF : manifest validitas aplikasi 1 KB (bootloader)
  * 0x0800FC00..0x0800FFFF : EEPROM emulasi 1 KB
  */
 #define APP_FLASH_START             0x08001800UL

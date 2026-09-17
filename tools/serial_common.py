@@ -32,16 +32,30 @@ def find_sideboard_port(requested=None):
 
 
 def open_sideboard_port(requested="auto", baud=921600, timeout=0.05,
-                        attempts=100, delay=0.20):
-    """Tunggu/retry open hingga ~20 s; cocok saat USB adapter re-enumerate."""
+                        attempts=20, delay=0.20):
+    """Buka serial dengan retry terukur dan tanpa toggle DTR/RTS.
+
+    exclusive=True mencegah dua tool sideboard mencampur frame pada port yang sama.
+    DTR/RTS diset sebelum open agar PL2303 tidak ditoggle setiap reconnect.
+    """
     last = None
     for attempt in range(max(attempts, 1)):
         try:
             port = find_sideboard_port(requested)
-            s = serial.Serial(port, baud, timeout=timeout, write_timeout=max(timeout, 0.20))
+            s = serial.Serial(port=None, baudrate=baud, timeout=timeout,
+                              write_timeout=max(timeout, 0.20),
+                              rtscts=False, dsrdtr=False, exclusive=True)
+            s.dtr = False
+            s.rts = False
+            s.port = port
+            s.open()
             return s
         except (FileNotFoundError, serial.SerialException, OSError) as exc:
             last = exc
+            try:
+                if 's' in locals() and s.is_open: s.close()
+            except Exception:
+                pass
             if attempt + 1 < attempts:
                 time.sleep(delay)
     raise last if last else FileNotFoundError("Sideboard serial tidak tersedia")

@@ -9,10 +9,11 @@
 I2C_HandleTypeDef hi2c1;
 UART_HandleTypeDef huart2;
 
-#define UART_RX_RING_SIZE 64U
+#define UART_RX_RING_SIZE 128U
 static volatile uint8_t uart_rx_ring[UART_RX_RING_SIZE];
 static volatile uint8_t uart_rx_head = 0U;
 static volatile uint8_t uart_rx_tail = 0U;
+static volatile uint32_t uart_rx_overflow_counter = 0U;
 
 #define UART_TX_BUFFER_SIZE 128U
 static uint8_t uart_tx_buffer[UART_TX_BUFFER_SIZE];
@@ -172,6 +173,22 @@ void board_i2c_recover(void)
     i2c_init();
 }
 
+static void watchdog_init(void)
+{
+    /* ~10 s nominal @ LSI 40 kHz: /256, reload 1562. Cukup panjang untuk
+     * startup normal tetapi memulihkan deadlock nyata tanpa power-cycle. */
+    IWDG->KR = 0x5555U;
+    IWDG->PR = IWDG_PRESCALER_256;
+    IWDG->RLR = 1562U;
+    IWDG->KR = 0xAAAAU;
+    IWDG->KR = 0xCCCCU;
+}
+
+void board_watchdog_kick(void)
+{
+    IWDG->KR = 0xAAAAU;
+}
+
 void board_init(void)
 {
     /* Aplikasi berada setelah bootloader, jadi vector interrupt harus dipindahkan. */
@@ -189,6 +206,9 @@ void board_init(void)
     CoreDebug->DEMCR |= CoreDebug_DEMCR_TRCENA_Msk;
     DWT->CYCCNT = 0U;
     DWT->CTRL |= DWT_CTRL_CYCCNTENA_Msk;
+
+    watchdog_init();
+    board_watchdog_kick();
 }
 
 uint32_t board_micros(void)
@@ -281,15 +301,30 @@ int board_uart_tx_busy(void)
     return uart_tx_busy_flag != 0U;
 }
 
-void board_uart_tx_wait_idle(uint32_t timeout_us)
+int board_uart_tx_wait_idle(uint32_t timeout_us)
 {
     uint32_t start = board_micros();
     while (uart_tx_busy_flag) {
         if ((uint32_t)(board_micros() - start) >= timeout_us) {
-            break;
+            /* ACK/control lebih penting daripada telemetry. Jika async TX pernah
+             * tersangkut, batalkan frame telemetry agar TX sinkron tidak bercampur. */
+            uint32_t primask = __get_PRIMASK();
+            __disable_irq();
+            CLEAR_BIT(USART2->CR1, USART_CR1_TXEIE);
+            uart_tx_busy_flag = 0U;
+            uart_tx_len = 0U;
+            uart_tx_index = 0U;
+            if (!primask) __enable_irq();
+            return 0;
         }
         __WFI();
     }
+    return 1;
+}
+
+uint32_t board_uart_rx_overflow_count(void)
+{
+    return uart_rx_overflow_counter;
 }
 
 void USART2_IRQHandler(void)
@@ -300,10 +335,14 @@ void USART2_IRQHandler(void)
         uint8_t b = (uint8_t)USART2->DR;
         uint8_t head = uart_rx_head;
         uint8_t next = (uint8_t)((head + 1U) % UART_RX_RING_SIZE);
-        if (next != uart_rx_tail) {
-            uart_rx_ring[head] = b;
-            uart_rx_head = next;
+        if (next == uart_rx_tail) {
+            /* Drop byte tertua, pertahankan traffic terbaru. Parser melihat counter
+             * berubah dan akan reset frame parsial sebelum memproses data baru. */
+            uart_rx_tail = (uint8_t)((uart_rx_tail + 1U) % UART_RX_RING_SIZE);
+            uart_rx_overflow_counter++;
         }
+        uart_rx_ring[head] = b;
+        uart_rx_head = next;
     } else if (sr & (USART_SR_ORE | USART_SR_NE | USART_SR_FE | USART_SR_PE)) {
         /* Membaca DR setelah SR membersihkan flag error STM32F1. */
         (void)USART2->DR;

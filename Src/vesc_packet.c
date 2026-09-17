@@ -105,7 +105,7 @@ static int send_payload(UART_HandleTypeDef *uart,
         return 0;
     }
 
-    board_uart_tx_wait_idle(3000U);
+    (void)board_uart_tx_wait_idle(3000U);
 
     uint8_t frame[272];
     uint16_t f = 0U;
@@ -291,6 +291,13 @@ typedef struct {
 } RxState;
 
 static RxState rx;
+static uint32_t rx_last_byte_us = 0U;
+static uint32_t rx_seen_overflow = 0U;
+
+static void rx_reset(void)
+{
+    rx.state = 0U; rx.len = 0U; rx.index = 0U; rx.crc = 0U;
+}
 
 static int rx_feed(uint8_t b)
 {
@@ -300,7 +307,7 @@ static int rx_feed(uint8_t b)
         break;
     case 1:
         if (b == 0U || b > sizeof(rx.payload)) {
-            rx.state = 0U;
+            rx.state = (b == 2U) ? 1U : 0U;
         } else {
             rx.len = b;
             rx.index = 0U;
@@ -321,7 +328,7 @@ static int rx_feed(uint8_t b)
         break;
     case 5: {
         int ok = b == 3U && rx.crc == vesc_crc16(rx.payload, rx.len);
-        rx.state = 0U;
+        rx.state = (!ok && b == 2U) ? 1U : 0U;
         return ok;
     }
     default:
@@ -335,7 +342,22 @@ VescAction vesc_process_rx(UART_HandleTypeDef *uart,
                            const VescImuState *latest)
 {
     uint8_t byte;
+    uint32_t now_us = board_micros();
+    uint32_t overflow = board_uart_rx_overflow_count();
+    if (overflow != rx_seen_overflow ||
+        (rx.state != 0U && (uint32_t)(now_us - rx_last_byte_us) > 50000U)) {
+        rx_reset();
+        rx_seen_overflow = overflow;
+    }
     while (board_uart_rx_pop(&byte)) {
+        uint32_t overflow_now = board_uart_rx_overflow_count();
+        if (overflow_now != rx_seen_overflow) {
+            rx_reset();
+            rx_seen_overflow = overflow_now;
+        }
+        now_us = board_micros();
+        if (rx.state != 0U && (uint32_t)(now_us - rx_last_byte_us) > 20000U) rx_reset();
+        rx_last_byte_us = now_us;
         if (!rx_feed(byte)) {
             continue;
         }

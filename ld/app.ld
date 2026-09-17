@@ -1,10 +1,10 @@
-/* Linker aplikasi: bootloader 6 KB, aplikasi 57 KB, EEPROM emulasi 1 KB. */
+/* Linker aplikasi: bootloader 6 KB, aplikasi 56 KB, manifest 1 KB, EEPROM emulasi 1 KB. */
 ENTRY(Reset_Handler)
 _estack = 0x20005000;
 _Min_Heap_Size = 0;
 _Min_Stack_Size = 0x400;
 MEMORY {
-  FLASH (rx) : ORIGIN = 0x08001800, LENGTH = 57K
+  FLASH (rx) : ORIGIN = 0x08001800, LENGTH = 56K
   RAM (xrw)  : ORIGIN = 0x20000000, LENGTH = 20K
 }
 SECTIONS {

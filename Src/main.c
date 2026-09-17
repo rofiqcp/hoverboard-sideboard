@@ -58,6 +58,7 @@ static int aid_recent(uint32_t now_us,uint32_t last_us)
 
 static void service_bootloader_while_starting(void)
 {
+    board_watchdog_kick();
     VescImuState empty_state;
     memset(&empty_state, 0, sizeof(empty_state));
 
@@ -454,6 +455,7 @@ int main(void)
     memset(&aid_status,0,sizeof(aid_status));
 
     for (;;) {
+        board_watchdog_kick();
         /* TIM2 menentukan cadence service. Jika CPU pernah terlambat, pending>1
          * hanya menjadi diagnostik; FIFO tetap membawa semua sampel sensor. */
         uint32_t pending_ticks = board_wait_imu_tick();
