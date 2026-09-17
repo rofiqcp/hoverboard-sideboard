@@ -14,3 +14,6 @@ MDK-ARM/*.uvguix.*
 !build/VARIANT_HOVERBOARD/firmware.hex
 !build/VARIANT_HOVERBOARD/firmware.bin
 !build/VARIANT_HOVERBOARD/firmware.elf
+# Python cache
+__pycache__/
+*.py[cod]
