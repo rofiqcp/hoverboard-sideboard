@@ -6,7 +6,7 @@
 #define APP_START       0x08001800UL
 #define APP_END         0x0800FC00UL
 #define PAGE_SIZE       1024UL
-#define BOOT_WAIT_MS    800UL
+#define BOOT_WAIT_MS    1500UL
 #define CMD_INFO        0xF8U
 #define CMD_ERASE       0xF9U
 #define CMD_WRITE       0xFAU

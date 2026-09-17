@@ -171,8 +171,10 @@ def main():
     parser.add_argument("firmware", nargs="?", default=".pio/build/APP_STLINK/firmware.bin")
     parser.add_argument("--port", default=DEFAULT_PORT)
     parser.add_argument("--baud", type=int, default=DEFAULT_BAUD)
-    parser.add_argument("--handshake", type=float, default=3.0,
+    parser.add_argument("--handshake", type=float, default=4.0,
                         help="Lama mencoba menangkap bootloader setelah board di-reset")
+    parser.add_argument("--retries", type=int, default=6,
+                        help="Ulang sesi penuh bila USB putus saat enter/erase/write/verify")
     args = parser.parse_args()
 
     path = Path(args.firmware)
@@ -181,34 +183,45 @@ def main():
         return 2
     image = path.read_bytes()
 
-    try:
-        selected_port = find_sideboard_port(args.port)
-        with open_sideboard_port(selected_port, args.baud, timeout=0.03) as port:
-            print(f"Mencari bootloader di {selected_port} @ {args.baud} baud ...")
-            try:
-                info = catch_bootloader(port, 0.5)
-                print("Bootloader sudah aktif.")
-            except TimeoutError:
-                print("Aplikasi aktif; meminta reset ke bootloader lewat USART ...")
-                app_ack = request_bootloader_from_app(port, 2.0)
-                if app_ack:
-                    print("ACK aplikasi diterima; menunggu bootloader ...")
-                else:
-                    print("ACK aplikasi tidak terlihat; tetap cek apakah reset ke bootloader sudah terjadi ...")
-                time.sleep(0.10)
-                port.reset_input_buffer()
+    last = None
+    for attempt in range(1, max(args.retries, 1) + 1):
+        try:
+            # Port dicari ulang setiap sesi; ttyUSB/by-id boleh berubah setelah USB re-enumerate.
+            with open_sideboard_port(args.port, args.baud, timeout=0.03, attempts=150, delay=0.20) as port:
+                selected_port = port.port
+                print(f"Sesi flash {attempt}/{max(args.retries,1)} di {selected_port} @ {args.baud} baud ...")
                 try:
-                    info = catch_bootloader(port, max(args.handshake, 2.0))
+                    info = catch_bootloader(port, 0.7)
+                    print("Bootloader sudah aktif.")
                 except TimeoutError:
-                    if not app_ack:
-                        raise TimeoutError("Aplikasi tidak menjawab ENTER_BOOTLOADER dan bootloader juga tidak tertangkap")
-                    raise
-                print("Bootloader berhasil dimasuki tanpa ST-LINK.")
-            flash_image(port, image, info)
-    except Exception as exc:
-        print(f"GAGAL: {exc}", file=sys.stderr)
-        return 1
-    return 0
+                    print("Aplikasi aktif; meminta reset ke bootloader lewat USART ...")
+                    try:
+                        app_ack = request_bootloader_from_app(port, 2.5)
+                    except (serial.SerialException, OSError):
+                        # USB boleh hilang tepat ketika MCU menerima F1. Sesi berikut akan
+                        # reconnect dan mencoba INFO; jangan menganggap F1 gagal.
+                        app_ack = False
+                        raise
+                    print("ACK aplikasi diterima." if app_ack else
+                          "ACK aplikasi tidak terlihat; tetap cari bootloader.")
+                    time.sleep(0.10)
+                    try: port.reset_input_buffer()
+                    except Exception: pass
+                    info = catch_bootloader(port, max(args.handshake, 2.0))
+                    print("Bootloader berhasil dimasuki tanpa ST-LINK.")
+                flash_image(port, image, info)
+                return 0
+        except (serial.SerialException, OSError, FileNotFoundError, TimeoutError, RuntimeError) as exc:
+            last = exc
+            print(f"Sesi flash {attempt} terputus/gagal: {exc}", file=sys.stderr)
+            if attempt < max(args.retries, 1):
+                print("Reconnect dan ulang ERASE+WRITE dari awal ...", file=sys.stderr)
+                time.sleep(0.50)
+                continue
+            break
+    print(f"GAGAL setelah {max(args.retries,1)} sesi: {last}", file=sys.stderr)
+    return 1
+
 
 
 if __name__ == "__main__":

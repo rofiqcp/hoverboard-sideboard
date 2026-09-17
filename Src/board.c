@@ -334,8 +334,11 @@ void board_reboot_to_bootloader(void)
 
 void board_panic(void)
 {
-    __disable_irq();
-    for (;;) __NOP();
+    /* Fail-safe recovery: jangan hard-lock aplikasi. Jika init hardware atau
+     * runtime masuk kondisi fatal, paksa software reset ke bootloader dan
+     * set magic agar bootloader tetap aktif tanpa timeout. Bootloader memakai
+     * register langsung sehingga tidak bergantung pada HAL aplikasi. */
+    board_reboot_to_bootloader();
 }
 
 void SysTick_Handler(void)

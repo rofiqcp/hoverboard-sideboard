@@ -27,40 +27,58 @@ def crc16(data: bytes) -> int:
 
 
 def read_exact(port: serial.Serial, count: int) -> bytes:
-    """Baca tepat sejumlah byte atau hasil kosong saat timeout."""
+    """Compatibility helper; read_frame memakai sliding buffer yang lebih robust."""
     data = bytearray()
     deadline = time.monotonic() + 0.25
     while len(data) < count and time.monotonic() < deadline:
         data.extend(port.read(count - len(data)))
     return bytes(data)
 
+
+_RX_BUFFERS = {}
+
 def read_frame(port: serial.Serial):
-    """Cari dan validasi satu frame VESC pendek: 2,len,payload,crc_hi,crc_lo,3."""
-    while True:
-        first = port.read(1)
-        if not first:
-            return None, "timeout"
-        if first[0] != 2:
-            continue
+    """Sliding VESC frame parser yang tahan buka-port di tengah stream/byte corrupt.
 
-        length_b = read_exact(port, 1)
-        if len(length_b) != 1:
-            return None, "timeout"
-        length = length_b[0]
-        if length == 0 or length > 192:
-            continue
-
-        rest = read_exact(port, length + 3)
-        if len(rest) != length + 3:
-            return None, "timeout"
-        payload = rest[:length]
-        crc_rx = (rest[length] << 8) | rest[length + 1]
-        stop = rest[length + 2]
-        if stop != 3:
-            return None, "stop"
-        if crc16(payload) != crc_rx:
-            return None, "crc"
-        return payload, None
+    Kandidat start palsu (0x02 di dalam payload) hanya membuang satu byte lalu
+    parser scan ulang. Ini mencegah satu false start membuang frame valid berikutnya.
+    """
+    key = id(port)
+    buf = _RX_BUFFERS.setdefault(key, bytearray())
+    deadline = time.monotonic() + 0.30
+    last_error = "timeout"
+    while time.monotonic() < deadline:
+        while True:
+            try:
+                start = buf.index(2)
+            except ValueError:
+                buf.clear(); break
+            if start:
+                del buf[:start]
+            if len(buf) < 2:
+                break
+            n = buf[1]
+            if n == 0 or n > 192:
+                del buf[0]; last_error = "length"; continue
+            total = 2 + n + 3
+            if len(buf) < total:
+                break
+            payload = bytes(buf[2:2+n])
+            crc_rx = (buf[2+n] << 8) | buf[3+n]
+            stop = buf[4+n]
+            if stop == 3 and crc16(payload) == crc_rx:
+                del buf[:total]
+                return payload, None
+            last_error = "crc" if stop == 3 else "stop"
+            # Jangan buang total kandidat: start ini mungkin berasal dari payload
+            # frame parsial. Geser satu byte agar start asli berikutnya tetap ditemukan.
+            del buf[0]
+        chunk = port.read(256)
+        if chunk:
+            buf.extend(chunk)
+            if len(buf) > 1024:
+                del buf[:-512]
+    return None, last_error
 
 
 def decode_imu(payload: bytes):
