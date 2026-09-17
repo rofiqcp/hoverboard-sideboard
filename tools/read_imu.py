@@ -9,6 +9,7 @@ import argparse
 import struct
 import time
 import serial
+import weakref
 from serial_common import find_sideboard_port, open_sideboard_port
 
 PORT_DEFAULT = "auto"
@@ -35,7 +36,7 @@ def read_exact(port: serial.Serial, count: int) -> bytes:
     return bytes(data)
 
 
-_RX_BUFFERS = {}
+_RX_BUFFERS = weakref.WeakKeyDictionary()
 
 def read_frame(port: serial.Serial):
     """Sliding VESC frame parser yang tahan buka-port di tengah stream/byte corrupt.
@@ -43,8 +44,9 @@ def read_frame(port: serial.Serial):
     Kandidat start palsu (0x02 di dalam payload) hanya membuang satu byte lalu
     parser scan ulang. Ini mencegah satu false start membuang frame valid berikutnya.
     """
-    key = id(port)
-    buf = _RX_BUFFERS.setdefault(key, bytearray())
+    buf = _RX_BUFFERS.get(port)
+    if buf is None:
+        buf = bytearray(); _RX_BUFFERS[port] = buf
     deadline = time.monotonic() + 0.30
     last_error = "timeout"
     while time.monotonic() < deadline:
@@ -83,7 +85,7 @@ def read_frame(port: serial.Serial):
 
 def decode_imu(payload: bytes):
     """Decode protocol v2 (79), v3 (101), dan v4 validity (104 byte)."""
-    if not payload or payload[0] != COMM_SIDEBOARD_IMU or len(payload) not in (79, 101, 104):
+    if not payload or payload[0] != COMM_SIDEBOARD_IMU or len(payload) not in (79, 101, 104, 114):
         return None
     if len(payload) == 79:
         fields = struct.unpack(">BBHII7h12iBBBH", payload)
@@ -92,7 +94,7 @@ def decode_imu(payload: bytes):
         fields = struct.unpack(">BBHII7h12iBBB12H", payload)
         extra = fields[28:39]
     else:
-        fields = struct.unpack(">BBHII7h12iBBB12HBH", payload)
+        fields = struct.unpack(">BBHII7h12iBBB12HBH", payload[:104])
         extra = fields[28:39]
     command, version, flags, seq, time_us = fields[:5]
     ax, ay, az, temp, gx, gy, gz = fields[5:12]
@@ -111,15 +113,19 @@ def decode_imu(payload: bytes):
         "aid_age_ms": 65535, "aid_reject": 0,
         "att_std_deg": (0.0,0.0,0.0), "vel_std": (0.0,0.0,0.0), "pos_std": (0.0,0.0,0.0),
         "nav_status": 0, "health_resets": 0,
+        "temp_c": temp / 340.0 + 36.53, "imu_whoami": 0, "imu_class": 0, "observed_sample_hz": 0.0,
     }
     if extra:
         data["aid_age_ms"], data["aid_reject"] = extra[:2]
         data["att_std_deg"] = tuple(x/1000.0 for x in extra[2:5])
         data["vel_std"] = tuple(x/1000.0 for x in extra[5:8])
         data["pos_std"] = tuple(x/1000.0 for x in extra[8:11])
-    if len(payload) == 104:
+    if len(payload) in (104,114):
         data["nav_status"] = fields[39]
         data["health_resets"] = fields[40]
+    if len(payload) == 114:
+        temp_md,who,klass,rate_mhz=struct.unpack(">iBBI",payload[104:114])
+        data["temp_c"]=temp_md/1000.0; data["imu_whoami"]=who; data["imu_class"]=klass; data["observed_sample_hz"]=rate_mhz/1000.0
     return data
 
 def flag_text(flags: int) -> str:
@@ -205,7 +211,7 @@ def main():
                     gx, gy, gz = data["gyro_raw"]
                     ag = (ax / 8192.0, ay / 8192.0, az / 8192.0)
                     gd = (gx / 65.5, gy / 65.5, gz / 65.5)
-                    temp_c = data["temp_raw"] / 340.0 + 36.53
+                    temp_c = data["temp_c"]
                     print(
                         f"seq={data['seq']:8d} t={data['time_us']:10d}us "
                         f"RPY=({data['roll']:8.3f},{data['pitch']:8.3f},{data['yaw']:8.3f})deg "
@@ -217,7 +223,8 @@ def main():
                         f"P=({data['pos'][0]:+.3f},{data['pos'][1]:+.3f},{data['pos'][2]:+.3f})m "
                         f"stdV=({data['vel_std'][0]:.3f},{data['vel_std'][1]:.3f},{data['vel_std'][2]:.3f}) "
                         f"aid_age={data['aid_age_ms']}ms rej={data['aid_reject']} "
-                        f"T={temp_c:.2f}C flags=0x{data['flags']:04X} [{flag_text(data['flags'])}] "
+                        f"T={temp_c:.2f}C imu=0x{data['imu_whoami']:02X}/c{data['imu_class']} rate={data['observed_sample_hz']:.2f}Hz "
+                        f"flags=0x{data['flags']:04X} [{flag_text(data['flags'])}] "
                         f"nav=0x{data['nav_status']:02X}[{nav_text(data['nav_status'])}] resets={data['health_resets']}"
                     )
         except KeyboardInterrupt:

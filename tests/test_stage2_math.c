@@ -23,6 +23,53 @@ int main(void){
     ck(vn<0.01f,"stationary velocity bounded <1 cm/s");
     ck(pn<0.05f,"stationary position bounded <5 cm");
 
+    /* FIFO can legally deliver up to ~40 ms of preintegrated data. The estimator
+     * must use the same dt as the delta increments, never clamp dt independently. */
+    eskf_nav_init(&f,a0);
+    {
+        float da40[3]={0,0,0}, dv40[3]={0,0,g*0.04f};
+        ck(eskf_nav_predict_delta(&f,da40,dv40,0.04f),"40 ms preintegrated delta accepted");
+        ck(fabsf(f.velocity[2])<1e-6f,"40 ms stationary delta has no false vertical velocity");
+    }
+
+    /* Moderate unaided motion previously drove P indefinite after the diagonal
+     * upper clamp saturated. FPF^T propagation must remain numerically healthy. */
+    eskf_nav_init(&f,a0);
+    for(int k=1;k<=12000;k++){
+        float t=k*0.01f;
+        float w[3]={0.05f*sinf(0.2f*t),0.04f*cosf(0.17f*t),0.35f*sinf(0.11f*t)};
+        float ac[3]={0.8f*sinf(0.13f*t),0.4f*cosf(0.19f*t),g};
+        float da[3],dv[3];
+        for(int i=0;i<3;i++){da[i]=w[i]*0.01f;dv[i]=ac[i]*0.01f;}
+        if(!eskf_nav_predict_delta(&f,da,dv,0.01f)){printf("FAIL: moderate-motion delta rejected\n");fail++;break;}
+    }
+    int cov_ok=1;
+    for(int r=0;r<ESKF_NAV_DIM;r++){
+        if(!isfinite(f.P[r][r]) || f.P[r][r]<=0.0f) cov_ok=0;
+        for(int c=r+1;c<ESKF_NAV_DIM;c++){
+            float x=f.P[r][c];
+            float bound=f.P[r][r]*f.P[c][c]*1.02f+1e-12f;
+            if(!isfinite(x) || x*x>bound) cov_ok=0;
+        }
+    }
+    ck(cov_ok,"covariance invariants hold after 120s moderate unaided motion");
+    {float q_before[4],v_before[3],p_before[3];memcpy(q_before,f.q,sizeof(q_before));memcpy(v_before,f.velocity,sizeof(v_before));memcpy(p_before,f.position,sizeof(p_before));
+     eskf_nav_reset_covariance(&f);
+     ck(memcmp(q_before,f.q,sizeof(q_before))==0 && memcmp(v_before,f.velocity,sizeof(v_before))==0 && memcmp(p_before,f.position,sizeof(p_before))==0,
+        "covariance recovery preserves nominal attitude/velocity/position");}
+
+    /* Sustained 0.1 g horizontal acceleration has magnitude ~1.005 g and must
+     * not be mistaken for a 5.7 degree gravity tilt while moving. */
+    eskf_nav_init(&f,a0);
+    for(int k=0;k<500;k++){
+        float da[3]={0,0,0},dv[3]={0.1f*g*0.01f,0,g*0.01f};
+        (void)eskf_nav_predict_delta(&f,da,dv,0.01f);
+        if((k&1)==0){float am[3]={0.1f*g,0,g};(void)eskf_nav_correct_gravity(&f,am,0);}
+    }
+    {float rr=0,pp=0,yy=0;eskf_nav_get_euler_deg(&f,&rr,&pp,&yy);
+     ck(fabsf(pp)<1.0f,"moving 0.1g acceleration is not fused as false pitch");
+     ck(f.velocity[0]>4.5f,"moving 0.1g acceleration remains real forward velocity");}
+
     ck(eskf_nav_reset_yaw(&f,170.0f*(float)M_PI/180.0f,2.0f*(float)M_PI/180.0f),"first absolute yaw reset 170 deg");
     float yaw=0; eskf_nav_get_euler_rad(&f,0,0,&yaw);
     ck(fabsf(yaw-170.0f*(float)M_PI/180.0f)<0.01f,"yaw reset exact");

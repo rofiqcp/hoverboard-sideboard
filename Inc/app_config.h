@@ -5,12 +5,15 @@
 
 /* Peta flash STM32F103C8 64 KB.
  * 0x08000000..0x080017FF : bootloader 6 KB
- * 0x08001800..0x0800F7FF : aplikasi 56 KB
+ * 0x08001800..0x0800F3FF : aplikasi 55 KB
+ * 0x0800F400..0x0800F7FF : settings journal A 1 KB
  * 0x0800F800..0x0800FBFF : manifest validitas aplikasi 1 KB (bootloader)
- * 0x0800FC00..0x0800FFFF : EEPROM emulasi 1 KB
+ * 0x0800FC00..0x0800FFFF : settings journal B / legacy EEPROM 1 KB
  */
 #define APP_FLASH_START             0x08001800UL
-#define EEPROM_FLASH_ADDR           0x0800FC00UL
+#define EEPROM_FLASH_ADDR_A         0x0800F400UL
+#define EEPROM_FLASH_ADDR_B         0x0800FC00UL
+#define EEPROM_FLASH_ADDR           EEPROM_FLASH_ADDR_B /* legacy schema location */
 #define FLASH_END_ADDR              0x08010000UL
 #define EEPROM_FLASH_PAGE_SIZE      1024UL
 
@@ -44,6 +47,8 @@
 #define ESKF_ACCEL_DIR_NOISE           0.060f
 #define ESKF_ACCEL_NIS_GATE             16.0f
 #define ESKF_GRAVITY_SCALAR_NIS_GATE      9.0f
+#define ESKF_GRAVITY_DIR_COS_STILL          0.99756405f /* 4 deg */
+#define ESKF_GRAVITY_DIR_COS_MOVING         0.99862953f /* 3 deg */
 #define ESKF_COVARIANCE_DIVIDER           2U
 
 /* Kalibrasi awal 2 detik pada 100 Hz. Jika board diam, bias gyro hasil rata-rata
@@ -59,6 +64,7 @@
 #define STILL_CAL_ACCEL_STD_MAX_G            0.04f
 #define STILL_CAL_ACCEL_NORM_ERR_G           0.08f
 #define ROTATE_FACE_MIN_SAMPLES              100U
+#define ROTATE_FACE_STABLE_SAMPLES             50U
 #define ROTATE_FACE_AXIS_MIN_G                0.80f
 #define ROTATE_FACE_OTHER_MAX_G               0.45f
 #define ROTATE_CAL_MIN_SPAN_G                 1.50f
@@ -67,6 +73,7 @@
 #define ROTATE_CAL_SCALE_MAX                  1.20f
 #define ROTATE_CAL_RMS_MAX_G                  0.06f
 #define ROTATE_CAL_MAX_ERROR_G                0.10f
+#define ROTATE_CAL_COND_FRO_MAX                 6.0f
 #define ZUPT_SIGMA_MPS                      0.03f
 #define ZERO_RATE_SIGMA_RAD                 0.008f
 #define NHC_SIGMA_MPS                         0.05f
@@ -104,7 +111,7 @@
 #define COMM_SIDEBOARD_AIDING          0xF4U
 #define COMM_GET_IMU_DATA              65U
 #define BOOTLOADER_REQUEST_MAGIC       0xB007U
-#define IMU_PROTOCOL_VERSION           4U
+#define IMU_PROTOCOL_VERSION           5U
 
 /* Flag telemetry supaya host tahu kualitas data. */
 #define IMU_FLAG_SENSOR_OK             (1U << 0)

@@ -22,12 +22,21 @@
 #define CFG_CMD_SET_LEVER_ARM   4U
 #define CFG_CMD_CLEAR_THERMAL   5U
 #define CFG_CMD_RESET_MOUNT     6U
+#define CFG_CMD_SET_NOISE       7U
+#define CFG_CMD_SET_ACCEL_CAL   8U
 
 #define AID_CMD_WHEEL_BODY_X    1U
 #define AID_CMD_WORLD_VELOCITY  2U
 #define AID_CMD_WORLD_POSITION  3U
 #define AID_CMD_YAW             4U
 #define AID_FLAG_NHC            (1U << 0)
+
+#define AID_TIMING_NOW          0U
+#define AID_TIMING_BOARD_US     1U
+#define AID_TIMING_AGE_US       2U
+#define AID_FRAME_LOCAL_ZUP     0U
+#define AID_FRAME_ENU           1U
+#define AID_FRAME_BODY          2U
 
 #define NAV_STATUS_ATT_VALID          (1U << 0)
 #define NAV_STATUS_VEL_AIDED          (1U << 1)
@@ -61,17 +70,23 @@ typedef struct {
     float position_std_m[3];
     uint8_t nav_status;
     uint16_t health_reset_count;
+    float temperature_c;
+    uint8_t imu_whoami;
+    uint8_t imu_class;
+    float observed_sample_hz;
 } VescImuState;
 
 typedef struct {
     uint8_t subcmd;
-    float value[6];
+    float value[12];
 } VescConfigRequest;
 
 typedef struct {
     uint8_t type;
     uint8_t flags;
-    uint32_t time_us;
+    uint8_t timing_mode;
+    uint8_t frame;
+    uint32_t time_us; /* board timestamp or measurement age, according to timing_mode. */
     float value[3];
     float sigma;
 } VescAidingRequest;

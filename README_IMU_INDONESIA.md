@@ -55,18 +55,19 @@ python3 tools/read_imu.py \
   --baud 921600
 ```
 
-## EEPROM emulasi
+## Settings journal A/B
 
-Page flash terakhir 1 KB dipakai sebagai EEPROM emulasi. Data dilindungi magic, version, length, dan CRC16. Yang disimpan saat ini adalah bias gyro awal dan parameter noise ESKF.
+Kalibrasi/config tidak lagi disimpan pada satu page. Firmware memakai journal A/B power-loss-safe dengan generation counter, CRC payload, dan commit marker yang ditulis paling akhir. Record lama tetap dipertahankan sampai record baru selesai diverifikasi dan committed.
 
 Peta flash:
 
 - `0x08000000..0x080017FF`: bootloader 6 KiB;
-- `0x08001800..0x0800F7FF`: aplikasi maksimum 56 KiB;
+- `0x08001800..0x0800F3FF`: aplikasi maksimum 55 KiB;
+- `0x0800F400..0x0800F7FF`: settings journal A 1 KiB;
 - `0x0800F800..0x0800FBFF`: manifest/commit marker aplikasi 1 KiB;
-- `0x0800FC00..0x0800FFFF`: EEPROM emulasi 1 KiB.
+- `0x0800FC00..0x0800FFFF`: settings journal B / legacy IMU4 1 KiB.
 
-Linker aplikasi berhenti tepat sebelum halaman manifest sehingga firmware tidak dapat menimpanya.
+Linker aplikasi berhenti tepat sebelum journal-A sehingga firmware tidak dapat menimpa settings, manifest, atau journal-B. Bootloader erase aplikasi juga berhenti di alamat yang sama.
 
 ## Bootloader UART
 
@@ -97,7 +98,7 @@ pio run -e APP_STLINK -t upload
 
 ## Catatan pengujian hardware saat implementasi
 
-I2C telah terbukti mendeteksi perangkat `0x68` dengan `WHO_AM_I=0x72`. Raw accel/gyro/suhu, FIFO 200 Hz, ESKF, native VESC IMU, serta upload aplikasi melalui USART2 921600 sudah diuji langsung pada board. CH340 normalnya muncul sebagai `/dev/serial/by-id/usb-1a86_USB_Serial-if00-port0` atau `/dev/ttyUSB0`.
+I2C telah terbukti mendeteksi perangkat `0x68` dengan `WHO_AM_I=0x72`. Raw accel/gyro/suhu, FIFO ~200 Hz, ESKF, native VESC IMU, serta upload aplikasi melalui USART2 921600 sudah diuji langsung pada board. Tool host memprioritaskan `/dev/serial/by-id/...` lalu fallback ke `/dev/ttyUSB*`/`ttyACM*`; board yang diuji saat ini muncul sebagai Prolific PL2303.
 
 Pada sesi Tahap 2 pernah terjadi USB hub host error Linux `-71` yang memutus seluruh downstream hub (CH340 ikut hilang sementara ST-LINK kemudian enumerate kembali). Itu adalah fault link/hub host, bukan ESKF/UART firmware. Tool host sekarang melakukan retry-open untuk transien serial, tetapi perangkat yang benar-benar hilang dari USB tetap perlu dipulihkan di level hub/kabel/power.
 
@@ -193,7 +194,7 @@ Catatan penting:
 - Yaw tetap relative tanpa heading aiding eksternal.
 - Position/velocity IMU-only tetap dead-reckoning; Tahap 2 perlu wheel odometry / external aiding untuk bounded navigation saat kendaraan bergerak.
 
-## Tahap 2 navigation aiding + calibration v4 (2026-09-17)
+## Tahap 2 navigation aiding + calibration IMU4 / telemetry v5 (2026-09-17)
 
 EEPROM sekarang schema `IMU4` dan otomatis migrasi dari `IMU3`. Field baru meliputi full accelerometer transform 3x3, quaternion `sensor_to_body`, gyro/accel thermal slope, dan IMU lever-arm terhadap body origin. Loader memvalidasi CRC, finite/range seluruh parameter kritis, determinant matrix, dan quaternion.
 
@@ -221,9 +222,48 @@ python3 tools/aiding_imu.py yaw 90 --sigma 2
 
 Wheel aiding mengobservasi body-forward velocity; NHC menahan body lateral/vertical velocity. Lever arm memakai koreksi `omega x r`. World velocity, world position, dan yaw memakai source reset ketika pertama acquire/ketika source timeout, lalu innovation fusion normal sesudah lock. Ini mencegah estimator menolak heading/velocity awal yang jauh dari state IMU-only.
 
-Protocol extended v4 menambahkan navigation validity/covariance status dan health-reset counter. Tanpa external aiding, status menunjukkan attitude valid + dead-reckoning + covariance valid. Native `COMM_GET_IMU_DATA=65` tetap kompatibel dan tidak berubah.
+Protocol extended **v5** mempertahankan prefix v4 dan menambahkan temperatur hasil konversi firmware, `WHO_AM_I`, device class, serta observed FIFO sample-rate. Navigation validity/covariance status dan health-reset counter tetap dikirim. Native `COMM_GET_IMU_DATA=65` tetap kompatibel dan tidak berubah.
 
 Safety ESKF Tahap 2 mencakup finite/range guards, absolute innovation guards, NIS gates, bounded correction step, realistic gyro/accel residual-bias limits, covariance/state health check, serta automatic estimator recovery bila state menjadi non-finite/tidak sehat. Yaw aiding tidak diizinkan menyeret gyro-bias residual hingga batas.
+
+### Kalibrasi presisi, thermal, dan identifikasi noise
+
+Logger resmi untuk data calibration/noise:
+
+```bash
+python3 tools/imu_log.py --duration 120 --output records/still.csv
+```
+
+Untuk thermal, ambil beberapa plateau dengan **orientasi board tetap sama** dan temperatur berbeda, lalu fit:
+
+```bash
+python3 tools/thermal_calibration.py records/t25.csv records/t35.csv records/t45.csv
+```
+
+Untuk noise/Q, rekam stationary panjang (disarankan >=10 menit untuk bias walk) lalu:
+
+```bash
+python3 tools/allan_analysis.py records/still_long.csv --curve-out records/allan.csv
+```
+
+Untuk accelerometer presisi, gunakan >=12 orientasi diam berbeda dan host ellipsoid fit; runtime firmware tetap memakai matrix 3x3 yang ringan:
+
+```bash
+python3 tools/accel_ellipsoid_calibration.py records/pose01.csv records/pose02.csv records/pose03.csv ...
+```
+
+Six-face firmware tetap tersedia sebagai field-calibration sederhana. Tool host hanya memberi rekomendasi/aplikasi jika quality gate lolos; log terlalu pendek ditolak.
+
+### External aiding frame/timing
+
+Command `0xF4` sekarang memiliki kontrak eksplisit: `body`, `local Z-up`, atau `ENU`; timing dapat `now`, `board timestamp`, atau **measurement age**. Untuk ROS/NUC gunakan `--age-ms` kecuali clock MCU-host sudah disinkronkan. World velocity/position ENU ditolak sampai yaw ENU berhasil meng-align local world. Full ESKF re-init menghapus alignment itu sehingga source ENU wajib reacquire yaw.
+
+Contoh:
+
+```bash
+python3 tools/aiding_imu.py yaw 90 --frame enu --age-ms 20 --sigma 2
+python3 tools/aiding_imu.py world-vel 1 0 0 --frame enu --age-ms 20 --sigma 0.10
+```
 
 Regression host dapat dijalankan tanpa board:
 

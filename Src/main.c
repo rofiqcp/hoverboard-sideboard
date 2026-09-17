@@ -31,9 +31,49 @@ typedef struct {
     uint32_t last_any_us, last_wheel_us, last_nhc_us;
     uint32_t last_yaw_us, last_vel_us, last_pos_us;
     uint32_t reject_count;
+    uint8_t enu_aligned;
 } ExternalAidStatus;
 
+typedef struct {
+    float q[4],velocity[3],position[3],gyro_bias[3],accel_bias[3];
+    uint8_t valid;
+} EskfNominalBackup;
+
+static void nominal_backup_update(EskfNominalBackup *b,const EskfNav *f)
+{
+    if(!b||!eskf_nav_nominal_is_healthy(f)) return;
+    memcpy(b->q,f->q,sizeof(b->q)); memcpy(b->velocity,f->velocity,sizeof(b->velocity));
+    memcpy(b->position,f->position,sizeof(b->position)); memcpy(b->gyro_bias,f->gyro_bias,sizeof(b->gyro_bias));
+    memcpy(b->accel_bias,f->accel_bias,sizeof(b->accel_bias)); b->valid=1U;
+}
+
+static int nominal_backup_restore(EskfNav *f,const EskfNominalBackup *b)
+{
+    if(!f||!b||!b->valid) return 0;
+    memcpy(f->q,b->q,sizeof(b->q)); memcpy(f->velocity,b->velocity,sizeof(b->velocity));
+    memcpy(f->position,b->position,sizeof(b->position)); memcpy(f->gyro_bias,b->gyro_bias,sizeof(b->gyro_bias));
+    memcpy(f->accel_bias,b->accel_bias,sizeof(b->accel_bias));
+    eskf_nav_reset_covariance(f); f->initialized=1U; return 1;
+}
+
 static volatile uint32_t filter_health_reset_count = 0U;
+
+static int accel_cal_config_valid(const float v[12])
+{
+    if(!v) return 0;
+    for(int i=0;i<3;i++) if(!isfinite(v[i]) || fabsf(v[i])>0.5f*GRAVITY_MPS2) return 0;
+    for(int i=3;i<12;i++) if(!isfinite(v[i]) || fabsf(v[i])>2.0f) return 0;
+    const float *T=&v[3];
+    float det=T[0]*(T[4]*T[8]-T[5]*T[7])-T[1]*(T[3]*T[8]-T[5]*T[6])+T[2]*(T[3]*T[7]-T[4]*T[6]);
+    if(!isfinite(det)||fabsf(det)<0.20f||fabsf(det)>5.0f) return 0;
+    float nT=0.0f,nAdj=0.0f; for(int i=0;i<9;i++)nT+=T[i]*T[i];
+    float adj[9]={T[4]*T[8]-T[5]*T[7], T[2]*T[7]-T[1]*T[8], T[1]*T[5]-T[2]*T[4],
+                  T[5]*T[6]-T[3]*T[8], T[0]*T[8]-T[2]*T[6], T[2]*T[3]-T[0]*T[5],
+                  T[3]*T[7]-T[4]*T[6], T[1]*T[6]-T[0]*T[7], T[0]*T[4]-T[1]*T[3]};
+    for(int i=0;i<9;i++)nAdj+=adj[i]*adj[i];
+    float cond=sqrtf(nT*nAdj)/fabsf(det);
+    return isfinite(cond)&&cond<=ROTATE_CAL_COND_FRO_MAX;
+}
 
 static void rpy_to_quat(float roll,float pitch,float yaw,float q[4])
 {
@@ -46,9 +86,13 @@ static void rpy_to_quat(float roll,float pitch,float yaw,float q[4])
     if(n>1e-6f)for(int i=0;i<4;i++)q[i]/=n;
 }
 
-static uint32_t aid_age_us(uint32_t now_us,uint32_t stamp_us)
+static int aid_age_us(uint32_t now_us,const VescAidingRequest *req,uint32_t *age_us)
 {
-    return stamp_us==0U ? 0U : (uint32_t)(now_us-stamp_us);
+    if(!req||!age_us) return 0;
+    if(req->timing_mode==AID_TIMING_NOW){*age_us=0U;return 1;}
+    if(req->timing_mode==AID_TIMING_AGE_US){*age_us=req->time_us;return 1;}
+    if(req->timing_mode==AID_TIMING_BOARD_US){*age_us=(uint32_t)(now_us-req->time_us);return 1;}
+    return 0;
 }
 
 static int aid_recent(uint32_t now_us,uint32_t last_us)
@@ -174,11 +218,16 @@ static int recover_filter_if_unhealthy(EskfNav *eskf,
                                       ImuPreintegrator *preintegrator,
                                       uint32_t *last_fifo_resync,
                                       uint8_t sample_is_still,
-                                      uint8_t *startup_zupt)
+                                      uint8_t *startup_zupt,
+                                      EskfNominalBackup *backup)
 {
     if (eskf_nav_is_healthy(eskf)) return 0;
     filter_health_reset_count++;
-    init_filter(eskf,raw,settings);
+    /* P/cross-covariance fault must not reinterpret linear acceleration as tilt.
+     * Restore the last known-good nominal state and only reset covariance. */
+    if(!nominal_backup_restore(eskf,backup)) {
+        init_filter(eskf,raw,settings);
+    }
     imu_preintegrator_init(preintegrator);
     (void)imu_mpu6xxx_fifo_reset();
     if(last_fifo_resync)*last_fifo_resync=imu_mpu6xxx_get_fifo_stats()->fifo_resync_count;
@@ -192,9 +241,11 @@ typedef struct {
     uint8_t still;
 } StillnessDetector;
 
-static int stillness_update(StillnessDetector *d, const float accel[3], const float gyro[3])
+static int stillness_update(StillnessDetector *d, const float accel[3], const float gyro[3],
+                            const EskfNav *eskf)
 {
-    /* Bandingkan norm kuadrat agar loop 100 Hz tidak membayar dua sqrtf. */
+    /* Magnitude + arah gravitasi + gyro hysteresis. Direction test memakai
+     * dot^2 sehingga tidak membutuhkan sqrtf pada loop 100 Hz. */
     const float dps_to_rad = 0.01745329251994329577f;
     float gyro_n2=gyro[0]*gyro[0]+gyro[1]*gyro[1]+gyro[2]*gyro[2];
     float accel_n2=accel[0]*accel[0]+accel[1]*accel[1]+accel[2]*accel[2];
@@ -203,8 +254,17 @@ static int stillness_update(StillnessDetector *d, const float accel[3], const fl
     float exit_g_lo=0.92f*0.92f*g2, exit_g_hi=1.08f*1.08f*g2;
     float enter_w2=dps_to_rad*dps_to_rad;
     float exit_w2=4.0f*dps_to_rad*dps_to_rad;
-    int enter_ok=gyro_n2<enter_w2 && accel_n2>enter_g_lo && accel_n2<enter_g_hi;
-    int exit_bad=gyro_n2>exit_w2 || accel_n2<exit_g_lo || accel_n2>exit_g_hi;
+    int direction_enter=1,direction_exit_bad=0;
+    if(eskf && accel_n2>1e-6f){
+        float R[3][3]; eskf_nav_rotation_matrix(eskf,R);
+        float dot=accel[0]*R[2][0]+accel[1]*R[2][1]+accel[2]*R[2][2];
+        float dot2=dot*dot;
+        /* enter <1.5 deg, exit >2.5 deg from predicted gravity direction. */
+        direction_enter=(dot>0.0f && dot2>0.9993148f*accel_n2);
+        direction_exit_bad=(dot<=0.0f || dot2<0.9980973f*accel_n2);
+    }
+    int enter_ok=gyro_n2<enter_w2 && accel_n2>enter_g_lo && accel_n2<enter_g_hi && direction_enter;
+    int exit_bad=gyro_n2>exit_w2 || accel_n2<exit_g_lo || accel_n2>exit_g_hi || direction_exit_bad;
 
     if (!d->still) {
         if (enter_ok) {
@@ -214,8 +274,6 @@ static int stillness_update(StillnessDetector *d, const float accel[3], const fl
     } else {
         if (exit_bad) {
             if (d->exit_count<50U) d->exit_count++;
-            /* Noise/spike singkat tidak boleh melepas stationary startup.
-             * Butuh motion evidence persisten 200 ms (20 tick @100 Hz). */
             if (d->exit_count>=20U) { d->still=0U; d->enter_count=0U; }
         } else d->exit_count=0U;
     }
@@ -336,6 +394,10 @@ static void fill_telemetry(VescImuState *out,
     if(master_stationary)out->nav_status|=NAV_STATUS_STATIONARY_BOUND;
     if(filter_health_reset_count>0U)out->nav_status|=NAV_STATUS_HEALTH_RECOVERED;
     out->health_reset_count=(uint16_t)(filter_health_reset_count>65535U?65535U:filter_health_reset_count);
+    const ImuDeviceInfo *di=imu_mpu6xxx_get_info(); const ImuFifoStats *fs=imu_mpu6xxx_get_fifo_stats();
+    out->temperature_c=raw->temperature_c;
+    out->imu_whoami=di?di->whoami:0U; out->imu_class=di?(uint8_t)di->device_class:0U;
+    out->observed_sample_hz=fs?fs->observed_sample_hz:0.0f;
 }
 
 int main(void)
@@ -348,9 +410,9 @@ int main(void)
     int eeprom_valid = settings_load_status != 0;
     if (!eeprom_valid) {
         eeprom_settings_defaults(&settings);
-    } else if (settings_load_status == 2) {
-        /* Migrasi IMU3 -> IMU4 dipersist sekali. Semua bias/noise/counter lama
-         * dipertahankan, field Tahap 2 mendapat default identity/zero. */
+    } else if (settings_load_status == 2 || settings_load_status == 3) {
+        /* Migrasi schema lama / single-page IMU4 ke journal A/B dipersist sekali.
+         * Page legacy tidak dihapus sebelum journal baru verified+committed. */
         eeprom_valid = eeprom_settings_save(&settings);
     }
 
@@ -410,6 +472,8 @@ int main(void)
 
     EskfNav eskf;
     init_filter(&eskf, &raw, &settings);
+    EskfNominalBackup nominal_backup={0};
+    nominal_backup_update(&nominal_backup,&eskf);
 
     /* Buang seluruh FIFO yang terkumpul selama kalibrasi startup. Data lama tidak
      * boleh ikut diintegrasikan sebagai gerakan setelah ESKF mulai. */
@@ -510,11 +574,24 @@ int main(void)
             service_bootloader_while_starting();
             continue;
         }
-        eskf_nav_predict_delta(&eskf, delta.delta_angle, delta.delta_velocity, delta.dt);
+        if (!eskf_nav_predict_delta(&eskf, delta.delta_angle, delta.delta_velocity, delta.dt)) {
+            /* Delta dan dt harus selalu merepresentasikan interval yang sama.
+             * Jangan clamp dt sambil tetap memakai delta penuh. */
+            imu_preintegrator_init(&preintegrator);
+            aid_status.reject_count++;
+            continue;
+        }
 
-        int sample_is_still = stillness_update(&stillness, accel, gyro);
+        float accel_for_gravity[3], gyro_for_still[3];
+        float inv_delta_dt=1.0f/delta.dt;
+        for(int i=0;i<3;i++){
+            accel_for_gravity[i]=delta.delta_velocity[i]*inv_delta_dt;
+            gyro_for_still[i]=delta.delta_angle[i]*inv_delta_dt;
+        }
+
+        int sample_is_still = stillness_update(&stillness, accel_for_gravity, gyro_for_still, &eskf);
         if(recover_filter_if_unhealthy(&eskf,&raw,&settings,&preintegrator,
-                                      &last_fifo_resync,(uint8_t)sample_is_still,&startup_zupt)) {
+                                      &last_fifo_resync,(uint8_t)sample_is_still,&startup_zupt,&nominal_backup)) {
             aid_status.reject_count++;
             continue;
         }
@@ -522,7 +599,7 @@ int main(void)
          * dan measurement-noise diperbesar agar percepatan AGV tidak dianggap tilt. */
         if (++gravity_divider >= 2U) {
             gravity_divider = 0U;
-            gravity_ok = (uint8_t)eskf_nav_correct_gravity(&eskf, accel, sample_is_still);
+            gravity_ok = (uint8_t)eskf_nav_correct_gravity(&eskf, accel_for_gravity, sample_is_still);
         }
 
         zupt_applied = 0U;
@@ -557,15 +634,25 @@ int main(void)
         }
 
         if (calibration.event_saved_needed) {
-            eeprom_valid = eeprom_settings_save(&settings);
-            calibration.event_saved_needed = 0U;
-            imu_apply_static_calibration(&raw, &settings, accel, gyro);
-            init_filter(&eskf, &raw, &settings);
-            zero_rate_sigma = zero_rate_sigma_from_settings(&settings);
-            imu_preintegrator_init(&preintegrator);
-            (void)imu_mpu6xxx_fifo_reset();
-            last_fifo_resync = imu_mpu6xxx_get_fifo_stats()->fifo_resync_count;
-            startup_zupt = 1U;
+            if (eeprom_settings_save(&settings)) {
+                eeprom_valid = 1;
+                calibration.event_saved_needed = 0U;
+                imu_apply_static_calibration(&raw, &settings, accel, gyro);
+                init_filter(&eskf, &raw, &settings);
+                memset(&aid_status,0,sizeof(aid_status)); /* world/yaw alignment invalid after full re-init */
+                zero_rate_sigma = zero_rate_sigma_from_settings(&settings);
+                imu_preintegrator_init(&preintegrator);
+                (void)imu_mpu6xxx_fifo_reset();
+                last_fifo_resync = imu_mpu6xxx_get_fifo_stats()->fifo_resync_count;
+                startup_zupt = 1U;
+            } else {
+                /* RAM calibration candidate belum boleh aktif bila persistence gagal.
+                 * Reload record committed terakhir dan laporkan kegagalan eksplisit. */
+                PersistedSettings rollback;
+                int ls=eeprom_settings_load(&rollback);
+                if(ls){settings=rollback;eeprom_valid=1;} else {eeprom_settings_defaults(&settings);eeprom_valid=0;}
+                calibration.event_saved_needed=0U; calibration.state=IMU_CAL_FAILED; calibration.error_code=7U;
+            }
         }
 
         /* Konversi Euler (atan2/asin) dan linear-accel cukup dihitung pada
@@ -599,14 +686,20 @@ int main(void)
         } else if (action == VESC_ACTION_CAL_ROTATE_FINISH) {
             int ok = imu_calibration_finish_rotate(&calibration, &settings);
             if (ok && calibration.event_saved_needed) {
-                eeprom_valid = eeprom_settings_save(&settings);
-                calibration.event_saved_needed = 0U;
-                init_filter(&eskf, &raw, &settings);
-                zero_rate_sigma = zero_rate_sigma_from_settings(&settings);
-                imu_preintegrator_init(&preintegrator);
-                (void)imu_mpu6xxx_fifo_reset();
-                last_fifo_resync = imu_mpu6xxx_get_fifo_stats()->fifo_resync_count;
-                startup_zupt = 1U;
+                if(eeprom_settings_save(&settings)) {
+                    eeprom_valid=1; calibration.event_saved_needed=0U;
+                    init_filter(&eskf, &raw, &settings);
+                    memset(&aid_status,0,sizeof(aid_status));
+                    zero_rate_sigma = zero_rate_sigma_from_settings(&settings);
+                    imu_preintegrator_init(&preintegrator);
+                    (void)imu_mpu6xxx_fifo_reset();
+                    last_fifo_resync = imu_mpu6xxx_get_fifo_stats()->fifo_resync_count;
+                    startup_zupt = 1U;
+                } else {
+                    PersistedSettings rollback; int ls=eeprom_settings_load(&rollback);
+                    if(ls){settings=rollback;eeprom_valid=1;}else{eeprom_settings_defaults(&settings);eeprom_valid=0;}
+                    calibration.event_saved_needed=0U; calibration.state=IMU_CAL_FAILED; calibration.error_code=7U; ok=0;
+                }
             }
             sync_calibration_status(&telemetry, &calibration);
             (void)vesc_send_calibration_status(&huart2, CAL_CMD_ROTATE_FINISH,
@@ -641,6 +734,10 @@ int main(void)
             VescConfigRequest req;
             if(vesc_take_config_request(&req)){
                 int changed=0,reinit=0;
+                if(req.subcmd!=CFG_CMD_GET && !sample_is_still){
+                    (void)vesc_send_config_status(&huart2,req.subcmd,3U,&settings);
+                    continue;
+                }
                 if(req.subcmd==CFG_CMD_SET_MOUNT_RPY){
                     rpy_to_quat(req.value[0],req.value[1],req.value[2],settings.sensor_to_body_q);
                     settings.calibration_flags|=CAL_FLAG_MOUNT_VALID; changed=1; reinit=1;
@@ -661,11 +758,31 @@ int main(void)
                     int valid=1;for(int i=0;i<3;i++)if(fabsf(req.value[i])>5.0f)valid=0;
                     if(valid){memcpy(settings.imu_position_body,req.value,sizeof(settings.imu_position_body));changed=1;}
                     else {(void)vesc_send_config_status(&huart2,req.subcmd,2U,&settings);continue;}
+                }else if(req.subcmd==CFG_CMD_SET_NOISE){
+                    int valid=isfinite(req.value[0])&&req.value[0]>0.0f&&req.value[0]<=1.0f&&
+                              isfinite(req.value[1])&&req.value[1]>0.0f&&req.value[1]<=20.0f&&
+                              isfinite(req.value[2])&&req.value[2]>=0.0f&&req.value[2]<=0.5f&&
+                              isfinite(req.value[3])&&req.value[3]>=0.0f&&req.value[3]<=5.0f&&
+                              isfinite(req.value[4])&&req.value[4]>0.0f&&req.value[4]<=1.0f;
+                    if(valid){settings.gyro_noise=req.value[0];settings.accel_process_noise=req.value[1];
+                        settings.gyro_bias_walk=req.value[2];settings.accel_bias_walk=req.value[3];settings.accel_dir_noise=req.value[4];changed=1;}
+                    else {(void)vesc_send_config_status(&huart2,req.subcmd,2U,&settings);continue;}
+                }else if(req.subcmd==CFG_CMD_SET_ACCEL_CAL){
+                    if(accel_cal_config_valid(req.value)){memcpy(settings.accel_offset,req.value,3U*sizeof(float));
+                        memcpy(settings.accel_transform,&req.value[3],9U*sizeof(float));
+                        settings.calibration_flags|=CAL_FLAG_ROTATE_VALID;changed=1;reinit=1;}
+                    else {(void)vesc_send_config_status(&huart2,req.subcmd,2U,&settings);continue;}
                 }
                 uint8_t status=0U;
                 if(changed){eeprom_valid=eeprom_settings_save(&settings);if(!eeprom_valid)status=1U;}
+                if(req.subcmd==CFG_CMD_SET_NOISE && status==0U){
+                    eskf.gyro_noise=settings.gyro_noise; eskf.accel_noise=settings.accel_process_noise;
+                    eskf.gyro_bias_walk=settings.gyro_bias_walk; eskf.accel_bias_walk=settings.accel_bias_walk;
+                    eskf.accel_dir_noise=settings.accel_dir_noise;
+                }
                 if(reinit && status==0U){
                     imu_apply_static_calibration(&raw,&settings,accel,gyro); init_filter(&eskf,&raw,&settings);
+                    memset(&aid_status,0,sizeof(aid_status));
                     imu_preintegrator_init(&preintegrator); (void)imu_mpu6xxx_fifo_reset();
                     last_fifo_resync=imu_mpu6xxx_get_fifo_stats()->fifo_resync_count;
                     startup_zupt=sample_is_still?1U:0U;
@@ -675,11 +792,16 @@ int main(void)
         } else if (action == VESC_ACTION_AIDING) {
             VescAidingRequest req;
             if(vesc_take_aiding_request(&req)){
-                uint32_t age=aid_age_us(now_us,req.time_us);
+                uint32_t age=0U;
+                uint8_t timing_ok=(uint8_t)aid_age_us(now_us,&req,&age);
                 uint16_t age_ms=(uint16_t)((age/1000U)>65535U?65535U:(age/1000U));
                 uint8_t status=0U; int ok=0;
-                if(age>AID_MAX_AGE_US){status=4U;aid_status.reject_count++;}
-                else{
+                if(!timing_ok || age>AID_MAX_AGE_US){status=4U;aid_status.reject_count++;}
+                else if((req.type==AID_CMD_WHEEL_BODY_X && req.frame!=AID_FRAME_BODY) ||
+                        (req.type!=AID_CMD_WHEEL_BODY_X && req.frame!=AID_FRAME_LOCAL_ZUP && req.frame!=AID_FRAME_ENU) ||
+                        ((req.type==AID_CMD_WORLD_VELOCITY || req.type==AID_CMD_WORLD_POSITION) && req.frame==AID_FRAME_ENU && !aid_status.enu_aligned)){
+                    status=6U; aid_status.reject_count++;
+                } else{
                     float sigma=req.sigma*(1.0f+(float)age/(float)AID_MAX_AGE_US);
                     if(req.type==AID_CMD_WHEEL_BODY_X){
                         float omega[3],lever_cross[3],target[3]={req.value[0],0.0f,0.0f};
@@ -715,18 +837,20 @@ int main(void)
                         if(!aid_recent(now_us,aid_status.last_yaw_us))
                             ok=eskf_nav_reset_yaw(&eskf,req.value[0],sigma);
                         else ok=eskf_nav_fuse_yaw(&eskf,req.value[0],sigma);
-                        if(ok){aid_status.last_yaw_us=now_us;aid_status.last_any_us=now_us;}
+                        if(ok){aid_status.last_yaw_us=now_us;aid_status.last_any_us=now_us;if(req.frame==AID_FRAME_ENU)aid_status.enu_aligned=1U;}
                     }
                     if(!ok){status=1U;aid_status.reject_count++;}
                     if(!eskf_nav_is_healthy(&eskf)) {
                         (void)recover_filter_if_unhealthy(&eskf,&raw,&settings,&preintegrator,
-                                                         &last_fifo_resync,(uint8_t)sample_is_still,&startup_zupt);
+                                                         &last_fifo_resync,(uint8_t)sample_is_still,&startup_zupt,&nominal_backup);
                         status=5U; aid_status.reject_count++;
                     }
                 }
                 (void)vesc_send_aiding_status(&huart2,req.type,status,age_ms);
             }
         }
+
+        nominal_backup_update(&nominal_backup,&eskf);
 
         if (telemetry_due) {
             (void)vesc_send_extended_imu(&huart2, &telemetry);

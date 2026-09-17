@@ -105,6 +105,10 @@ static void convert_sample(ImuSample *s)
 }
 int imu_mpu6xxx_fifo_reset(void)
 {
+    /* Jangan campur gap/reset FIFO ke estimator sample-rate window. Pertahankan
+     * observed_sample_hz terakhir, tetapi mulai pengukuran window dari nol. */
+    fifo_stats.rate_window_start_us=0U;
+    fifo_stats.rate_window_samples=0U;
     if (!write_reg(REG_FIFO_EN, 0x00U)) return 0;
     if (!write_reg(REG_USER_CTRL, USER_FIFO_RESET)) return 0;
     HAL_Delay(2U);

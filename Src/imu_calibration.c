@@ -10,7 +10,7 @@ static void reset_common(ImuCalibration *c)
 
 void imu_calibration_init(ImuCalibration *c) { reset_common(c); }
 void imu_calibration_start_still(ImuCalibration *c) { reset_common(c); c->state=IMU_CAL_STILL; }
-void imu_calibration_start_rotate(ImuCalibration *c) { reset_common(c); c->state=IMU_CAL_ROTATE; }
+void imu_calibration_start_rotate(ImuCalibration *c) { reset_common(c); c->state=IMU_CAL_ROTATE; c->current_face=-1; }
 void imu_calibration_cancel(ImuCalibration *c) { reset_common(c); c->state=IMU_CAL_IDLE; }
 
 static void rotate_sensor_to_body(const float q[4], const float in[3], float out[3])
@@ -138,7 +138,9 @@ static int select_face(const ImuSample *s)
 static void update_rotate(ImuCalibration *c,const ImuSample *s)
 {
     int face=select_face(s);
-    if (face<0) return;
+    if (face<0) { c->current_face=-1; c->face_stable_count=0U; return; }
+    if (c->current_face!=face) { c->current_face=(int8_t)face; c->face_stable_count=1U; return; }
+    if (c->face_stable_count<ROTATE_FACE_STABLE_SAMPLES) { c->face_stable_count++; return; }
     if (c->face_count[face] < 60000U) {
         for (int i=0;i<3;i++) c->face_sum[face][i]+=s->accel_mps2[i];
         c->face_count[face]++;
@@ -241,6 +243,10 @@ int imu_calibration_finish_rotate(ImuCalibration *c,PersistedSettings *s)
         }
     }
     if (!inverse3(A,T)) { c->state=IMU_CAL_FAILED; c->error_code=6U; return 0; }
+    float an2=0.0f,tn2=0.0f;
+    for(int r=0;r<3;r++) for(int col=0;col<3;col++){ an2+=A[r][col]*A[r][col]; tn2+=T[r][col]*T[r][col]; }
+    float cond_fro=sqrtf(an2*tn2);
+    if(!isfinite(cond_fro) || cond_fro>ROTATE_CAL_COND_FRO_MAX) { c->state=IMU_CAL_FAILED; c->error_code=6U; return 0; }
     for (int r=0;r<3;r++) for (int col=0;col<3;col++)
         candidate.accel_transform[r*3+col]=T[r][col];
 

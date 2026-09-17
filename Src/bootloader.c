@@ -4,9 +4,10 @@
 /* Bootloader sangat kecil: UART2 921600, framing VESC pendek, flash aplikasi.
  * Clock dibuat 64 MHz dari HSI/2 x16. APB1 = 32 MHz agar baud tinggi stabil. */
 #define APP_START       0x08001800UL
-#define APP_IMAGE_END   0x0800F800UL
+#define APP_IMAGE_END   0x0800F400UL
 #define APP_META_ADDR   0x0800F800UL
-#define EEPROM_ADDR     0x0800FC00UL
+#define SETTINGS_A_ADDR 0x0800F400UL
+#define SETTINGS_B_ADDR 0x0800FC00UL
 #define PAGE_SIZE       1024UL
 #define BOOT_WAIT_MS    1500UL
 #define CMD_INFO        0xF8U

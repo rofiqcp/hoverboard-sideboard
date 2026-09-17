@@ -142,7 +142,7 @@ static int send_payload_async(const uint8_t *payload, uint16_t len)
 
 int vesc_send_extended_imu(UART_HandleTypeDef *uart, const VescImuState *s)
 {
-    uint8_t payload[112];
+    uint8_t payload[120];
     uint16_t i = 0U;
 
     payload[i++] = COMM_SIDEBOARD_IMU;
@@ -185,6 +185,11 @@ int vesc_send_extended_imu(UART_HandleTypeDef *uart, const VescImuState *s)
     for (int k=0;k<3;k++) put_u16(payload,&i,sat_u16(s->position_std_m[k]*1000.0f));
     payload[i++]=s->nav_status;
     put_u16(payload,&i,s->health_reset_count);
+    /* v5 extension: temperature sudah dikonversi firmware dengan descriptor sensor,
+     * plus identitas sensor dan observed FIFO rate. Prefix v4 tetap byte-identical. */
+    put_i32(payload,&i,sat_i32(s->temperature_c*1000.0f));
+    payload[i++]=s->imu_whoami; payload[i++]=s->imu_class;
+    put_u32(payload,&i,(uint32_t)sat_i32(s->observed_sample_hz*1000.0f));
 
     (void)uart;
     return send_payload_async(payload, i);
@@ -262,7 +267,7 @@ int vesc_take_aiding_request(VescAidingRequest *out)
 int vesc_send_config_status(UART_HandleTypeDef *uart,uint8_t subcmd,uint8_t status,
                             const PersistedSettings *s)
 {
-    uint8_t payload[64]; uint16_t i=0U;
+    uint8_t payload[136]; uint16_t i=0U;
     payload[i++]=COMM_SIDEBOARD_CONFIG; payload[i++]=subcmd; payload[i++]=status;
     if(s){
         for(int k=0;k<4;k++)put_i32(payload,&i,sat_i32(s->sensor_to_body_q[k]*1000000.0f));
@@ -270,6 +275,13 @@ int vesc_send_config_status(UART_HandleTypeDef *uart,uint8_t subcmd,uint8_t stat
         for(int k=0;k<3;k++)put_i32(payload,&i,sat_i32(s->accel_temp_slope[k]*1000000.0f));
         for(int k=0;k<3;k++)put_i32(payload,&i,sat_i32(s->imu_position_body[k]*1000.0f));
         put_u32(payload,&i,s->calibration_flags);
+        put_i32(payload,&i,sat_i32(s->gyro_noise*1000000.0f));
+        put_i32(payload,&i,sat_i32(s->accel_process_noise*1000000.0f));
+        put_i32(payload,&i,sat_i32(s->gyro_bias_walk*1000000.0f));
+        put_i32(payload,&i,sat_i32(s->accel_bias_walk*1000000.0f));
+        put_i32(payload,&i,sat_i32(s->accel_dir_noise*1000000.0f));
+        for(int k=0;k<3;k++)put_i32(payload,&i,sat_i32(s->accel_offset[k]*1000000.0f));
+        for(int k=0;k<9;k++)put_i32(payload,&i,sat_i32(s->accel_transform[k]*1000000.0f));
     }
     return send_payload(uart,payload,i);
 }
@@ -286,7 +298,7 @@ typedef struct {
     uint8_t state;
     uint8_t len;
     uint8_t index;
-    uint8_t payload[40];
+    uint8_t payload[64];
     uint16_t crc;
 } RxState;
 
@@ -368,6 +380,18 @@ VescAction vesc_process_rx(UART_HandleTypeDef *uart,
             return VESC_ACTION_BOOTLOADER;
         }
 
+        /* Selama startup latest==NULL. Jangan queue/menelan command yang belum bisa
+         * dieksekusi: beri BUSY=7 agar host bisa retry setelah estimator READY. */
+        if (!latest) {
+            if (rx.len >= 2U && rx.payload[0] == COMM_SIDEBOARD_CONFIG)
+                (void)vesc_send_config_status(uart,rx.payload[1],7U,0);
+            else if (rx.len >= 2U && rx.payload[0] == COMM_SIDEBOARD_AIDING)
+                (void)vesc_send_aiding_status(uart,rx.payload[1],7U,0U);
+            else if (rx.len >= 2U && rx.payload[0] == COMM_SIDEBOARD_CALIBRATION)
+                (void)vesc_send_calibration_status(uart,rx.payload[1],7U,0);
+            continue;
+        }
+
         if (rx.len >= 3U && rx.payload[0] == COMM_GET_IMU_DATA) {
             /* Jangan kirim state nol saat estimator belum siap pada fase startup. */
             if (latest) {
@@ -390,6 +414,10 @@ VescAction vesc_process_rx(UART_HandleTypeDef *uart,
                 for(int k=0;k<6;k++) pending_config.value[k]=(float)get_i32(&rx.payload[2+4*k])*1.0e-6f;
             } else if (pending_config.subcmd==CFG_CMD_SET_LEVER_ARM && rx.len==14U) {
                 for(int k=0;k<3;k++) pending_config.value[k]=(float)get_i32(&rx.payload[2+4*k])*0.001f;
+            } else if (pending_config.subcmd==CFG_CMD_SET_NOISE && rx.len==22U) {
+                for(int k=0;k<5;k++) pending_config.value[k]=(float)get_i32(&rx.payload[2+4*k])*1.0e-6f;
+            } else if (pending_config.subcmd==CFG_CMD_SET_ACCEL_CAL && rx.len==50U) {
+                for(int k=0;k<12;k++) pending_config.value[k]=(float)get_i32(&rx.payload[2+4*k])*1.0e-6f;
             } else {
                 (void)vesc_send_config_status(uart,pending_config.subcmd,2U,0); continue;
             }
@@ -399,19 +427,29 @@ VescAction vesc_process_rx(UART_HandleTypeDef *uart,
         if (rx.len >= 2U && rx.payload[0] == COMM_SIDEBOARD_AIDING) {
             memset(&pending_aiding,0,sizeof(pending_aiding));
             pending_aiding.type=rx.payload[1];
-            if(pending_aiding.type==AID_CMD_WHEEL_BODY_X && rx.len==13U){
-                pending_aiding.time_us=get_u32(&rx.payload[2]);
-                pending_aiding.value[0]=(float)get_i32(&rx.payload[6])*0.001f;
-                pending_aiding.sigma=(float)get_u16(&rx.payload[10])*0.001f;
-                pending_aiding.flags=rx.payload[12];
-            }else if((pending_aiding.type==AID_CMD_WORLD_VELOCITY || pending_aiding.type==AID_CMD_WORLD_POSITION) && rx.len==20U){
-                pending_aiding.time_us=get_u32(&rx.payload[2]);
-                for(int k=0;k<3;k++)pending_aiding.value[k]=(float)get_i32(&rx.payload[6+4*k])*0.001f;
-                pending_aiding.sigma=(float)get_u16(&rx.payload[18])*0.001f;
-            }else if(pending_aiding.type==AID_CMD_YAW && rx.len==12U){
-                pending_aiding.time_us=get_u32(&rx.payload[2]);
-                pending_aiding.value[0]=(float)get_i32(&rx.payload[6])*0.001f*0.0174532925199433f;
-                pending_aiding.sigma=(float)get_u16(&rx.payload[10])*0.001f*0.0174532925199433f;
+            uint8_t base=2U;
+            /* Format baru: type,timing_mode,frame,time_or_age,...
+             * Format lama tetap diterima untuk backward compatibility. */
+            int modern=(rx.len==15U || rx.len==22U || rx.len==14U);
+            if(modern){
+                pending_aiding.timing_mode=rx.payload[2]; pending_aiding.frame=rx.payload[3];
+                pending_aiding.time_us=get_u32(&rx.payload[4]); base=8U;
+                if(pending_aiding.timing_mode>AID_TIMING_AGE_US){(void)vesc_send_aiding_status(uart,pending_aiding.type,2U,0U);continue;}
+            }else{
+                pending_aiding.time_us=get_u32(&rx.payload[2]); base=6U;
+                pending_aiding.timing_mode=pending_aiding.time_us?AID_TIMING_BOARD_US:AID_TIMING_NOW;
+                pending_aiding.frame=(pending_aiding.type==AID_CMD_WHEEL_BODY_X)?AID_FRAME_BODY:AID_FRAME_LOCAL_ZUP;
+            }
+            if(pending_aiding.type==AID_CMD_WHEEL_BODY_X && ((modern&&rx.len==15U)||(!modern&&rx.len==13U))){
+                pending_aiding.value[0]=(float)get_i32(&rx.payload[base])*0.001f;
+                pending_aiding.sigma=(float)get_u16(&rx.payload[base+4U])*0.001f;
+                pending_aiding.flags=rx.payload[base+6U];
+            }else if((pending_aiding.type==AID_CMD_WORLD_VELOCITY || pending_aiding.type==AID_CMD_WORLD_POSITION) && ((modern&&rx.len==22U)||(!modern&&rx.len==20U))){
+                for(int k=0;k<3;k++)pending_aiding.value[k]=(float)get_i32(&rx.payload[base+4U*k])*0.001f;
+                pending_aiding.sigma=(float)get_u16(&rx.payload[base+12U])*0.001f;
+            }else if(pending_aiding.type==AID_CMD_YAW && ((modern&&rx.len==14U)||(!modern&&rx.len==12U))){
+                pending_aiding.value[0]=(float)get_i32(&rx.payload[base])*0.001f*0.0174532925199433f;
+                pending_aiding.sigma=(float)get_u16(&rx.payload[base+4U])*0.001f*0.0174532925199433f;
             }else{
                 (void)vesc_send_aiding_status(uart,pending_aiding.type,2U,0U); continue;
             }

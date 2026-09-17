@@ -24,6 +24,8 @@ typedef struct {
     float sum_temp;
     float face_sum[6][3];
     uint16_t face_count[6];
+    uint16_t face_stable_count;
+    int8_t current_face;
     uint8_t event_saved_needed;
     uint8_t error_code;
 } ImuCalibration;

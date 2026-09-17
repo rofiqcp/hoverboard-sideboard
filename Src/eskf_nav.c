@@ -190,10 +190,30 @@ static int update1_sparse(EskfNav *f,
         Tm[r][c]=v; Tm[c][r]=v;
     }
     memcpy(f->P,Tm,sizeof(f->P));
-    for (int i=0;i<ESKF_NAV_DIM;i++) f->P[i][i]=clampf_local(f->P[i][i],1e-9f,1e6f);
+    for (int i=0;i<ESKF_NAV_DIM;i++) if (f->P[i][i] < 1e-9f) f->P[i][i]=1e-9f;
     inject_state(f,dxm);
     reset_covariance_attitude(f,&dxm[IDX_TH]);
     return 1;
+}
+
+static void reset_covariance_defaults(EskfNav *f)
+{
+    memset(f->P,0,sizeof(f->P));
+    for(int i=0;i<3;i++) {
+        f->P[IDX_TH+i][IDX_TH+i]=0.08f*0.08f;
+        f->P[IDX_V+i][IDX_V+i]=0.20f*0.20f;
+        f->P[IDX_P+i][IDX_P+i]=0.10f*0.10f;
+        f->P[IDX_BG+i][IDX_BG+i]=0.03f*0.03f;
+        f->P[IDX_BA+i][IDX_BA+i]=0.20f*0.20f;
+    }
+    f->covariance_dt_accum=0.0f;
+    f->covariance_divider=0U;
+}
+
+void eskf_nav_reset_covariance(EskfNav *f)
+{
+    if(!f) return;
+    reset_covariance_defaults(f);
 }
 
 void eskf_nav_init(EskfNav *f,const float accel[3]) {
@@ -206,13 +226,7 @@ void eskf_nav_init(EskfNav *f,const float accel[3]) {
     f->gyro_bias_walk=ESKF_GYRO_BIAS_WALK_RAD;
     f->accel_bias_walk=ESKF_ACCEL_BIAS_WALK;
     f->accel_dir_noise=ESKF_ACCEL_DIR_NOISE;
-    for(int i=0;i<3;i++) {
-        f->P[IDX_TH+i][IDX_TH+i]=0.08f*0.08f;
-        f->P[IDX_V+i][IDX_V+i]=0.20f*0.20f;
-        f->P[IDX_P+i][IDX_P+i]=0.10f*0.10f;
-        f->P[IDX_BG+i][IDX_BG+i]=0.03f*0.03f;
-        f->P[IDX_BA+i][IDX_BA+i]=0.20f*0.20f;
-    }
+    reset_covariance_defaults(f);
     f->initialized=1U;
 }
 
@@ -263,8 +277,31 @@ static void covariance_predict(EskfNav *f, const float w[3], const float fb[3],
         }
     }
 
+    /* Discretisasi F ~= I + A*dt: P = F*P*F^T + Q.
+     * Term dt^2*A*P*A^T wajib dipertahankan agar PSD tidak rusak.
+     * A hanya punya row nonzero untuk theta/velocity/position, sehingga
+     * extra term dihitung sparse tanpa generic 15x15 matrix multiply. */
     for (int r=0;r<ESKF_NAV_DIM;r++) for (int c=r;c<ESKF_NAV_DIM;c++) {
-        float v=f->P[r][c]+cov_dt*(Tm[r][c]+Tm[c][r]);
+        float second=0.0f;
+        if (r<IDX_BG && c<IDX_BG) {
+            float brc=0.0f,bcr=0.0f;
+            if (c<IDX_V) {
+                for(int k=0;k<3;k++) brc += Tm[r][IDX_TH+k]*(-skew_w[c][k]);
+                brc -= Tm[r][IDX_BG+c];
+            } else if (c<IDX_P) {
+                int a=c-IDX_V;
+                for(int k=0;k<3;k++) { brc += Tm[r][IDX_TH+k]*vel_theta[a][k]; brc -= Tm[r][IDX_BA+k]*R[a][k]; }
+            } else { brc = Tm[r][IDX_V+(c-IDX_P)]; }
+            if (r<IDX_V) {
+                for(int k=0;k<3;k++) bcr += Tm[c][IDX_TH+k]*(-skew_w[r][k]);
+                bcr -= Tm[c][IDX_BG+r];
+            } else if (r<IDX_P) {
+                int a=r-IDX_V;
+                for(int k=0;k<3;k++) { bcr += Tm[c][IDX_TH+k]*vel_theta[a][k]; bcr -= Tm[c][IDX_BA+k]*R[a][k]; }
+            } else { bcr = Tm[c][IDX_V+(r-IDX_P)]; }
+            second=0.5f*(brc+bcr);
+        }
+        float v=f->P[r][c] + cov_dt*(Tm[r][c]+Tm[c][r]) + cov_dt*cov_dt*second;
         f->P[r][c]=v; f->P[c][r]=v;
     }
 
@@ -275,18 +312,22 @@ static void covariance_predict(EskfNav *f, const float w[3], const float fb[3],
     for (int i=0;i<3;i++) {
         f->P[IDX_TH+i][IDX_TH+i]+=qg;
         f->P[IDX_V+i][IDX_V+i]+=qa;
+        /* White acceleration noise also contributes to position and v-p cross covariance. */
+        float qpv=f->accel_noise*f->accel_noise*cov_dt*cov_dt*0.5f;
+        float qp=f->accel_noise*f->accel_noise*cov_dt*cov_dt*cov_dt*(1.0f/3.0f);
+        f->P[IDX_V+i][IDX_P+i]+=qpv; f->P[IDX_P+i][IDX_V+i]=f->P[IDX_V+i][IDX_P+i];
+        f->P[IDX_P+i][IDX_P+i]+=qp;
         f->P[IDX_BG+i][IDX_BG+i]+=qbg;
         f->P[IDX_BA+i][IDX_BA+i]+=qba;
     }
-    for (int i=0;i<ESKF_NAV_DIM;i++)
-        f->P[i][i]=clampf_local(f->P[i][i],1e-9f,1e6f);
+    for (int i=0;i<ESKF_NAV_DIM;i++) if (f->P[i][i] < 1e-9f) f->P[i][i]=1e-9f;
 }
 
-void eskf_nav_predict_delta(EskfNav *f, const float delta_angle[3],
+int eskf_nav_predict_delta(EskfNav *f, const float delta_angle[3],
                             const float delta_velocity[3], float dt)
 {
-    if (!f || !f->initialized || !delta_angle || !delta_velocity || dt<=0.0f) return;
-    dt=clampf_local(dt,0.001f,0.03f);
+    if (!f || !f->initialized || !delta_angle || !delta_velocity ||
+        !isfinite(dt) || dt < 0.001f || dt > 0.050f) return 0;
 
     float dtheta[3], dvel_body[3], half_theta[3];
     for (int i=0;i<3;i++) {
@@ -316,6 +357,7 @@ void eskf_nav_predict_delta(EskfNav *f, const float delta_angle[3],
     float inv_dt=1.0f/dt, w[3], fb[3];
     for (int i=0;i<3;i++) { w[i]=dtheta[i]*inv_dt; fb[i]=dvel_body[i]*inv_dt; }
     covariance_predict(f,w,fb,Rmid,dt);
+    return 1;
 }
 
 void eskf_nav_predict(EskfNav *f, const float gyro[3], const float accel[3], float dt)
@@ -323,7 +365,7 @@ void eskf_nav_predict(EskfNav *f, const float gyro[3], const float accel[3], flo
     if (!gyro || !accel || dt<=0.0f) return;
     float da[3],dv[3];
     for (int i=0;i<3;i++) { da[i]=gyro[i]*dt; dv[i]=accel[i]*dt; }
-    eskf_nav_predict_delta(f,da,dv,dt);
+    (void)eskf_nav_predict_delta(f,da,dv,dt);
 }
 
 int eskf_nav_correct_gravity(EskfNav *f, const float accel[3], int stationary)
@@ -339,6 +381,11 @@ int eskf_nav_correct_gravity(EskfNav *f, const float accel[3], int stationary)
     if (gr<gate_min || gr>gate_max) { f->gravity_reject_count++; return 0; }
 
     float z[3]={a[0]/n,a[1]/n,a[2]/n};
+    float h_gate[3]; gravity_body(f,h_gate);
+    float dir_dot=z[0]*h_gate[0]+z[1]*h_gate[1]+z[2]*h_gate[2];
+    float dir_gate=stationary ? ESKF_GRAVITY_DIR_COS_STILL : ESKF_GRAVITY_DIR_COS_MOVING;
+    if(!isfinite(dir_dot) || dir_dot<dir_gate) { f->gravity_reject_count++; return 0; }
+
     float sigma=f->accel_dir_noise*(stationary ? 1.0f : ESKF_MOVING_GRAVITY_NOISE_SCALE);
     sigma*=1.0f+8.0f*fabsf(gr-1.0f);
 
@@ -530,7 +577,7 @@ void eskf_nav_get_std(const EskfNav *f,float att[3],float vel[3],float pos[3])
     }
 }
 
-int eskf_nav_is_healthy(const EskfNav *f)
+int eskf_nav_nominal_is_healthy(const EskfNav *f)
 {
     if(!f||!f->initialized)return 0;
     float qn=0.0f;
@@ -542,10 +589,23 @@ int eskf_nav_is_healthy(const EskfNav *f)
         if(!isfinite(f->gyro_bias[i])||fabsf(f->gyro_bias[i])>ESKF_GYRO_BIAS_LIMIT_RAD*1.01f)return 0;
         if(!isfinite(f->accel_bias[i])||fabsf(f->accel_bias[i])>ESKF_ACCEL_BIAS_LIMIT_MPS2*1.01f)return 0;
     }
-    for(int r=0;r<ESKF_NAV_DIM;r++)for(int c=0;c<ESKF_NAV_DIM;c++){
-        if(!isfinite(f->P[r][c]))return 0;
+    return 1;
+}
+
+int eskf_nav_is_healthy(const EskfNav *f)
+{
+    if(!eskf_nav_nominal_is_healthy(f))return 0;
+    for(int i=0;i<ESKF_NAV_DIM;i++) {
+        float d=f->P[i][i];
+        if(!isfinite(d) || d<1e-10f || d>1e18f) return 0;
     }
-    for(int i=0;i<ESKF_NAV_DIM;i++)if(f->P[i][i]<1e-10f||f->P[i][i]>1e6f)return 0;
+    /* P selalu ditulis simetris, jadi cukup scan upper triangle. */
+    for(int r=0;r<ESKF_NAV_DIM;r++) for(int c=r+1;c<ESKF_NAV_DIM;c++) {
+        float x=f->P[r][c];
+        if(!isfinite(x)) return 0;
+        float bound=f->P[r][r]*f->P[c][c]*1.02f + 1e-12f;
+        if(x*x>bound) return 0;
+    }
     return 1;
 }
 
