@@ -117,3 +117,14 @@ Hardware after these changes: 500/500 telemetry frames valid, 0 sequence loss, 0
 - Explicit sculling correction was **not** added: current ArduPilot raw-accel backend integrates accel*dt while applying coning to delta-angle, and this firmware already rotates delta-V with mid-interval attitude. A custom extra sculling term would risk double compensation without a matching validated reference implementation.
 
 Final hardware gate after these changes: still calibration `DONE`, telemetry 50.0 Hz, zero sequence/CRC/framing errors, health resets 0, WHO_AM_I `0x72`, observed sensor rate ~200.5 Hz.
+
+## Follow-up hardware validation — 2026-09-18
+- Fixed bootloader command latency/RX-overrun: application CRC validity is cached once at boot; INFO/GO are O(1), ERASE invalidates the cache, VERIFY commits it, and TX-complete is awaited before GO.
+- Bootloader validation: 10/10 app-F1-INFO-GO cycles plus full 46.9 kB UART rewrite/CRC/GO passed. Settings journal A/B SHA remained byte-identical across firmware update.
+- F4 aiding v2 adds 16-bit request ID and firmware duplicate-reply cache. Retry of the same ID never fuses the measurement twice. Hardware duplicate test: first ACK intentionally/lossy, retry received status 4, reject counter delta remained exactly 1.
+- F4 stress after the change: stale/rejected responses 50/50, accepted wheel/NHC responses 20/20, no timeout.
+- Real still calibration reached DONE and persisted to journal; newest journal A generation 13 was CRC-valid, backup B generation 12 remained CRC-valid. `flags=0x1`, so no synthetic rotate/mount/thermal validity was written.
+- Incomplete rotate + finish failed with error 2; rotate + cancel returned IDLE; both left journal SHA unchanged. Singular accel-cal command was rejected with status 2 and also left both journal pages unchanged.
+- Telemetry final gate: 1000/1000 frames, zero sequence/CRC/framing errors, ~49.9 Hz, health reset 0. Native VESC 20/20, CONFIG GET 10/10, calibration STATUS 10/10.
+- Allan tool sample-rate calculation now uses unwrapped MCU `board_us`. A real 25 s stationary log measured 49.942 Hz; bias-walk estimation remains intentionally disabled until >=10 min data is available.
+- Physical six-face/multi-orientation, thermal-plateau and lever-arm *values* are not fabricated. Their state machines, rejection gates, persistence and host synthetic fits are tested; actual values still require physically moving/heating/measuring the board.

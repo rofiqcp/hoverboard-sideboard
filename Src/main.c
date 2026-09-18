@@ -517,6 +517,12 @@ int main(void)
     memset(&telemetry, 0, sizeof(telemetry));
     ExternalAidStatus aid_status;
     memset(&aid_status,0,sizeof(aid_status));
+    /* Retry idempotent F4: cache reply request-id terakhir per source. Duplicate
+     * tidak boleh difuse dua kali; firmware hanya mengulang ACK yang sama. */
+    uint16_t aid_req_id[5]={0U};
+    uint16_t aid_req_age_ms[5]={0U};
+    uint8_t aid_req_status[5]={0U};
+    uint8_t aid_req_valid[5]={0U};
 
     for (;;) {
         board_watchdog_kick();
@@ -640,6 +646,7 @@ int main(void)
                 imu_apply_static_calibration(&raw, &settings, accel, gyro);
                 init_filter(&eskf, &raw, &settings);
                 memset(&aid_status,0,sizeof(aid_status)); /* world/yaw alignment invalid after full re-init */
+                memset(aid_req_valid,0,sizeof(aid_req_valid));
                 zero_rate_sigma = zero_rate_sigma_from_settings(&settings);
                 imu_preintegrator_init(&preintegrator);
                 (void)imu_mpu6xxx_fifo_reset();
@@ -690,6 +697,7 @@ int main(void)
                     eeprom_valid=1; calibration.event_saved_needed=0U;
                     init_filter(&eskf, &raw, &settings);
                     memset(&aid_status,0,sizeof(aid_status));
+                    memset(aid_req_valid,0,sizeof(aid_req_valid));
                     zero_rate_sigma = zero_rate_sigma_from_settings(&settings);
                     imu_preintegrator_init(&preintegrator);
                     (void)imu_mpu6xxx_fifo_reset();
@@ -783,6 +791,7 @@ int main(void)
                 if(reinit && status==0U){
                     imu_apply_static_calibration(&raw,&settings,accel,gyro); init_filter(&eskf,&raw,&settings);
                     memset(&aid_status,0,sizeof(aid_status));
+                    memset(aid_req_valid,0,sizeof(aid_req_valid));
                     imu_preintegrator_init(&preintegrator); (void)imu_mpu6xxx_fifo_reset();
                     last_fifo_resync=imu_mpu6xxx_get_fifo_stats()->fifo_resync_count;
                     startup_zupt=sample_is_still?1U:0U;
@@ -792,6 +801,12 @@ int main(void)
         } else if (action == VESC_ACTION_AIDING) {
             VescAidingRequest req;
             if(vesc_take_aiding_request(&req)){
+                if(req.has_request_id && req.type<=AID_CMD_YAW && aid_req_valid[req.type] &&
+                   aid_req_id[req.type]==req.request_id){
+                    (void)vesc_send_aiding_status_id(&huart2,req.type,aid_req_status[req.type],
+                                                     aid_req_age_ms[req.type],req.request_id);
+                    goto aiding_action_done;
+                }
                 uint32_t age=0U;
                 uint8_t timing_ok=(uint8_t)aid_age_us(now_us,&req,&age);
                 uint16_t age_ms=(uint16_t)((age/1000U)>65535U?65535U:(age/1000U));
@@ -846,8 +861,15 @@ int main(void)
                         status=5U; aid_status.reject_count++;
                     }
                 }
-                (void)vesc_send_aiding_status(&huart2,req.type,status,age_ms);
+                if(req.has_request_id && req.type<=AID_CMD_YAW){
+                    aid_req_id[req.type]=req.request_id; aid_req_status[req.type]=status;
+                    aid_req_age_ms[req.type]=age_ms; aid_req_valid[req.type]=1U;
+                    (void)vesc_send_aiding_status_id(&huart2,req.type,status,age_ms,req.request_id);
+                }else{
+                    (void)vesc_send_aiding_status(&huart2,req.type,status,age_ms);
+                }
             }
+        aiding_action_done: ;
         }
 
         nominal_backup_update(&nominal_backup,&eskf);

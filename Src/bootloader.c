@@ -19,6 +19,7 @@
 #define APP_MANIFEST_MAGIC 0x41505056UL /* APPV */
 
 static uint32_t ms_counter;
+static uint8_t cached_app_valid;
 
 typedef struct {
     uint32_t magic;
@@ -131,6 +132,17 @@ static void uart_put(uint8_t b)
     USART2->DR = b;
 }
 
+static void uart_wait_tx_complete(void)
+{
+    /* TXE hanya berarti data register kosong; TC memastikan shift register juga
+     * selesai. Wajib sebelum GO mematikan USART/jump agar ACK terakhir tidak hilang. */
+    uint32_t start = boot_millis();
+    while (!(USART2->SR & USART_SR_TC)) {
+        watchdog_kick();
+        if ((uint32_t)(boot_millis() - start) > 10U) break;
+    }
+}
+
 static void send_packet(const uint8_t *payload, uint8_t len)
 {
     uint16_t crc = crc16(payload, len);
@@ -139,6 +151,7 @@ static void send_packet(const uint8_t *payload, uint8_t len)
     uart_put((uint8_t)(crc >> 8));
     uart_put((uint8_t)crc);
     uart_put(3U);
+    uart_wait_tx_complete();
 }
 
 static int flash_wait(void)
@@ -340,7 +353,7 @@ static uint8_t process_payload(const uint8_t *p, uint8_t len)
         reply[11] = (uint8_t)(PAGE_SIZE >> 8);
         reply[12] = (uint8_t)PAGE_SIZE;
         reply[13] = 128U;
-        reply[14] = app_valid() ? 1U : 0U;
+        reply[14] = cached_app_valid;
         send_packet(reply, 15U);
         return 1U;
     }
@@ -349,6 +362,7 @@ static uint8_t process_payload(const uint8_t *p, uint8_t len)
         boot_request_set();
         reply[0] = CMD_ERASE;
         reply[1] = erase_app() ? 0U : 1U;
+        if (reply[1] == 0U) cached_app_valid = 0U;
         send_packet(reply, 2U);
         return 1U;
     }
@@ -370,18 +384,18 @@ static uint8_t process_payload(const uint8_t *p, uint8_t len)
         uint16_t expected_crc = ((uint16_t)p[5] << 8) | p[6];
         reply[0] = CMD_VERIFY;
         reply[1] = verify_and_commit_app(image_len, expected_crc) ? 0U : 1U;
+        cached_app_valid = (reply[1] == 0U) ? 1U : 0U;
         send_packet(reply, 2U);
         return 1U;
     }
 
     if (p[0] == CMD_GO && len == 1U) {
         boot_request_set();
-        uint8_t valid = app_valid() ? 1U : 0U;
+        uint8_t valid = cached_app_valid;
         reply[0] = CMD_GO; reply[1] = valid ? 0U : 1U;
         send_packet(reply, 2U);
         if (valid) boot_request_clear();
-        for (volatile uint32_t i = 0; i < 40000U; i++) { __NOP(); }
-        jump_app();
+        if (valid) jump_app();
         return 1U;
     }
 
@@ -443,6 +457,9 @@ int main(void)
     RCC->CSR |= RCC_CSR_RMVF;
     hw_init();
     watchdog_init();
+    /* CRC image lengkap cukup sekali saat boot. Command INFO/GO harus O(1) agar RX
+     * 921600 baud tidak overrun saat host mengirim command berikutnya. */
+    cached_app_valid = app_valid() ? 1U : 0U;
     PacketRx rx = {0};
     uint8_t stay_in_boot = boot_request_active();
     uint32_t start_ms = boot_millis();
@@ -464,7 +481,7 @@ int main(void)
         /* Valid app normal: boot setelah window. Reset watchdog app: beri host 5 s
          * untuk INFO/F1 sebelum auto-retry. App invalid atau latch update: stay. */
         if (!stay_in_boot && (uint32_t)(boot_millis() - start_ms) >= auto_boot_wait) {
-            if (app_valid()) jump_app();
+            if (cached_app_valid) jump_app();
             stay_in_boot = 1U; /* Invalid manifest/image: recovery mode forever. */
         }
     }

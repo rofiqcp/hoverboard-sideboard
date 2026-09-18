@@ -294,6 +294,15 @@ int vesc_send_aiding_status(UART_HandleTypeDef *uart,uint8_t type,uint8_t status
     return send_payload(uart,payload,i);
 }
 
+int vesc_send_aiding_status_id(UART_HandleTypeDef *uart,uint8_t type,uint8_t status,
+                               uint16_t age_ms,uint16_t request_id)
+{
+    uint8_t payload[7]; uint16_t i=0U;
+    payload[i++]=COMM_SIDEBOARD_AIDING; payload[i++]=type; payload[i++]=status;
+    put_u16(payload,&i,age_ms); put_u16(payload,&i,request_id);
+    return send_payload(uart,payload,i);
+}
+
 typedef struct {
     uint8_t state;
     uint8_t len;
@@ -428,26 +437,39 @@ VescAction vesc_process_rx(UART_HandleTypeDef *uart,
             memset(&pending_aiding,0,sizeof(pending_aiding));
             pending_aiding.type=rx.payload[1];
             uint8_t base=2U;
-            /* Format baru: type,timing_mode,frame,time_or_age,...
+            /* Format modern v1: type,timing,frame,time_or_age,...
+             * Format modern v2 menambah request_id uint16 untuk retry idempotent.
              * Format lama tetap diterima untuk backward compatibility. */
-            int modern=(rx.len==15U || rx.len==22U || rx.len==14U);
+            int modern_v2=(rx.len==17U || rx.len==24U || rx.len==16U);
+            int modern_v1=(rx.len==15U || rx.len==22U || rx.len==14U);
+            int modern=(modern_v1 || modern_v2);
             if(modern){
                 pending_aiding.timing_mode=rx.payload[2]; pending_aiding.frame=rx.payload[3];
-                pending_aiding.time_us=get_u32(&rx.payload[4]); base=8U;
-                if(pending_aiding.timing_mode>AID_TIMING_AGE_US){(void)vesc_send_aiding_status(uart,pending_aiding.type,2U,0U);continue;}
+                if(modern_v2){
+                    pending_aiding.has_request_id=1U;
+                    pending_aiding.request_id=get_u16(&rx.payload[4]);
+                    pending_aiding.time_us=get_u32(&rx.payload[6]); base=10U;
+                }else{
+                    pending_aiding.time_us=get_u32(&rx.payload[4]); base=8U;
+                }
+                if(pending_aiding.timing_mode>AID_TIMING_AGE_US){
+                    if(pending_aiding.has_request_id)(void)vesc_send_aiding_status_id(uart,pending_aiding.type,2U,0U,pending_aiding.request_id);
+                    else (void)vesc_send_aiding_status(uart,pending_aiding.type,2U,0U);
+                    continue;
+                }
             }else{
                 pending_aiding.time_us=get_u32(&rx.payload[2]); base=6U;
                 pending_aiding.timing_mode=pending_aiding.time_us?AID_TIMING_BOARD_US:AID_TIMING_NOW;
                 pending_aiding.frame=(pending_aiding.type==AID_CMD_WHEEL_BODY_X)?AID_FRAME_BODY:AID_FRAME_LOCAL_ZUP;
             }
-            if(pending_aiding.type==AID_CMD_WHEEL_BODY_X && ((modern&&rx.len==15U)||(!modern&&rx.len==13U))){
+            if(pending_aiding.type==AID_CMD_WHEEL_BODY_X && ((modern_v2&&rx.len==17U)||(modern_v1&&rx.len==15U)||(!modern&&rx.len==13U))){
                 pending_aiding.value[0]=(float)get_i32(&rx.payload[base])*0.001f;
                 pending_aiding.sigma=(float)get_u16(&rx.payload[base+4U])*0.001f;
                 pending_aiding.flags=rx.payload[base+6U];
-            }else if((pending_aiding.type==AID_CMD_WORLD_VELOCITY || pending_aiding.type==AID_CMD_WORLD_POSITION) && ((modern&&rx.len==22U)||(!modern&&rx.len==20U))){
+            }else if((pending_aiding.type==AID_CMD_WORLD_VELOCITY || pending_aiding.type==AID_CMD_WORLD_POSITION) && ((modern_v2&&rx.len==24U)||(modern_v1&&rx.len==22U)||(!modern&&rx.len==20U))){
                 for(int k=0;k<3;k++)pending_aiding.value[k]=(float)get_i32(&rx.payload[base+4U*k])*0.001f;
                 pending_aiding.sigma=(float)get_u16(&rx.payload[base+12U])*0.001f;
-            }else if(pending_aiding.type==AID_CMD_YAW && ((modern&&rx.len==14U)||(!modern&&rx.len==12U))){
+            }else if(pending_aiding.type==AID_CMD_YAW && ((modern_v2&&rx.len==16U)||(modern_v1&&rx.len==14U)||(!modern&&rx.len==12U))){
                 pending_aiding.value[0]=(float)get_i32(&rx.payload[base])*0.001f*0.0174532925199433f;
                 pending_aiding.sigma=(float)get_u16(&rx.payload[base+4U])*0.001f*0.0174532925199433f;
             }else{

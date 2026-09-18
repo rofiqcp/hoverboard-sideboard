@@ -5,15 +5,23 @@ import numpy as np
 COLS=["gx_rads","gy_rads","gz_rads","ax_mps2","ay_mps2","az_mps2"]
 
 def load(path):
-    t=[]; data={k:[] for k in COLS}; temp=[]
+    host=[]; board=[]; data={k:[] for k in COLS}; temp=[]
     with open(path,newline="") as f:
         for r in csv.DictReader(f):
             try:
-                t.append(float(r["host_s"])); temp.append(float(r["temp_c"]));
+                host.append(float(r["host_s"])); board.append(int(r["board_us"]) & 0xffffffff); temp.append(float(r["temp_c"]))
                 for k in COLS:data[k].append(float(r[k]))
             except (KeyError,ValueError): pass
-    if len(t)<1000: raise SystemExit("ERROR: log terlalu pendek (<1000 sample)")
-    dt=np.diff(np.asarray(t)); fs=1.0/float(np.median(dt))
+    if len(host)<1000: raise SystemExit("ERROR: log terlalu pendek (<1000 sample)")
+    # Gunakan clock MCU, bukan median host inter-arrival. Serial dapat burst sehingga
+    # median host_s menghasilkan sample-rate palsu. board_us di-unwrap modulo 2^32.
+    total_us=0
+    for a,b in zip(board,board[1:]): total_us += (b-a) & 0xffffffff
+    if total_us>0:
+        duration=total_us*1.0e-6; fs=(len(board)-1)/duration
+    else:
+        duration=host[-1]-host[0]; fs=(len(host)-1)/duration
+    if not (5.0 <= fs <= 1000.0): raise SystemExit(f"ERROR: sample-rate log tidak masuk akal: {fs:.3f} Hz")
     return fs,np.asarray(temp),{k:np.asarray(v) for k,v in data.items()}
 
 def allan(x,fs):

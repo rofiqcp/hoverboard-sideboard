@@ -86,6 +86,8 @@ typedef struct {
     uint8_t flags;
     uint8_t timing_mode;
     uint8_t frame;
+    uint8_t has_request_id;
+    uint16_t request_id;
     uint32_t time_us; /* board timestamp or measurement age, according to timing_mode. */
     float value[3];
     float sigma;
@@ -113,6 +115,8 @@ int vesc_send_calibration_status(UART_HandleTypeDef *uart, uint8_t subcmd,
 int vesc_send_config_status(UART_HandleTypeDef *uart, uint8_t subcmd, uint8_t status,
                             const PersistedSettings *s);
 int vesc_send_aiding_status(UART_HandleTypeDef *uart, uint8_t type, uint8_t status, uint16_t age_ms);
+int vesc_send_aiding_status_id(UART_HandleTypeDef *uart, uint8_t type, uint8_t status,
+                               uint16_t age_ms, uint16_t request_id);
 int vesc_take_config_request(VescConfigRequest *out);
 int vesc_take_aiding_request(VescAidingRequest *out);
 VescAction vesc_process_rx(UART_HandleTypeDef *uart, const VescImuState *latest);

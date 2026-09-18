@@ -272,3 +272,15 @@ Regression host dapat dijalankan tanpa board:
 ```
 
 Test tersebut memakai source C firmware yang sama untuk stationary propagation, yaw/velocity/position source reset, extreme measurement rejection, full 3x3 six-face calibration, dan transactional failure.
+
+## Validasi calibration + communication fault test (2026-09-18)
+
+Audit hardware lanjutan menemukan dua edge-case komunikasi dan keduanya sudah ditutup. Native VESC host query sekarang memberi settle/retry terhadap transient USB open. External aiding F4 modern v2 membawa `request_id` 16-bit; retry memakai ID yang sama dan firmware menyimpan reply terakhir per source, sehingga packet/ACK yang hilang dapat dikirim ulang tanpa measurement difuse dua kali. Format F4 lama/v1 tetap diterima.
+
+Bootloader v3 sekarang menghitung CRC/manifest validity aplikasi sekali saat boot dan menyimpan hasil di RAM. `INFO` dan `GO` tidak lagi menghitung CRC seluruh image (~47 kB) saat command datang; ini mencegah USART RX overrun pada 921600 baud. `ERASE` mengubah cache menjadi invalid, `VERIFY` yang sukses mengubahnya valid, dan setiap reply bootloader menunggu hardware `TC` sebelum handoff.
+
+Hasil hardware: 10/10 siklus `app -> F1 -> INFO -> GO -> app`, full UART `ERASE -> WRITE -> VERIFY -> GO`, 1000/1000 telemetry valid (~49.9 Hz), native VESC 20/20, CONFIG GET 10/10, CAL STATUS 10/10. F4 retry-idempotent menghasilkan stale ACK 50/50 dan accepted ACK 20/20; pengiriman request stale yang sama dua kali hanya menaikkan reject counter satu kali.
+
+Still calibration nyata mencapai `CAL DONE` dan journal terbaru tersimpan CRC-valid. Incomplete six-face finish dan cancel tidak mengubah satu byte journal. Invalid/singular accel calibration dibalas `status=2` dan SHA kedua page journal tetap identik. Full firmware update juga mempertahankan kedua page settings byte-identical.
+
+`allan_analysis.py` memakai `board_us` yang di-unwrap, bukan median inter-arrival host serial. Log nyata 1244 sample/25 s terbaca ~49.94 Hz; log pendek hanya dipakai untuk white-noise sanity check dan bias random walk tetap membutuhkan >=10 menit. Thermal fitter menolak dataset nyata tanpa span temperatur yang cukup, dan multi-orientation accel fitter menolak single-pose/coverage buruk sebelum parameter boleh di-apply.
