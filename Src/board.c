@@ -20,6 +20,7 @@ static uint8_t uart_tx_buffer[UART_TX_BUFFER_SIZE];
 static volatile uint16_t uart_tx_len = 0U;
 static volatile uint16_t uart_tx_index = 0U;
 static volatile uint8_t uart_tx_busy_flag = 0U;
+static volatile uint32_t uart_tx_started_us = 0U;
 
 /* TIM2 dipakai sebagai scheduler IMU 100 Hz. Counter pending membuat tick yang
  * datang ketika CPU masih bekerja tetap terlihat, tanpa menjalankan ESKF di ISR. */
@@ -282,6 +283,18 @@ int board_uart_rx_pop(uint8_t *out)
     return 1;
 }
 
+static void uart_cancel_async_tx(void)
+{
+    uint32_t primask = __get_PRIMASK();
+    __disable_irq();
+    CLEAR_BIT(USART2->CR1, USART_CR1_TXEIE);
+    uart_tx_busy_flag = 0U;
+    uart_tx_len = 0U;
+    uart_tx_index = 0U;
+    uart_tx_started_us = 0U;
+    if (!primask) __enable_irq();
+}
+
 int board_uart_tx_async(const uint8_t *data, uint16_t len)
 {
     if (!data || len == 0U || len > UART_TX_BUFFER_SIZE || uart_tx_busy_flag) {
@@ -291,6 +304,7 @@ int board_uart_tx_async(const uint8_t *data, uint16_t len)
     memcpy(uart_tx_buffer, data, len);
     uart_tx_len = len;
     uart_tx_index = 0U;
+    uart_tx_started_us = board_micros();
     uart_tx_busy_flag = 1U;
     SET_BIT(USART2->CR1, USART_CR1_TXEIE);
     return 1;
@@ -308,13 +322,7 @@ int board_uart_tx_wait_idle(uint32_t timeout_us)
         if ((uint32_t)(board_micros() - start) >= timeout_us) {
             /* ACK/control lebih penting daripada telemetry. Jika async TX pernah
              * tersangkut, batalkan frame telemetry agar TX sinkron tidak bercampur. */
-            uint32_t primask = __get_PRIMASK();
-            __disable_irq();
-            CLEAR_BIT(USART2->CR1, USART_CR1_TXEIE);
-            uart_tx_busy_flag = 0U;
-            uart_tx_len = 0U;
-            uart_tx_index = 0U;
-            if (!primask) __enable_irq();
+            uart_cancel_async_tx();
             return 0;
         }
         __WFI();
@@ -325,6 +333,26 @@ int board_uart_tx_wait_idle(uint32_t timeout_us)
 uint32_t board_uart_rx_overflow_count(void)
 {
     return uart_rx_overflow_counter;
+}
+
+void board_uart_service(void)
+{
+    /*
+     * Self-heal murah dan idempotent. USB-UART/host boleh hilang kapan saja;
+     * USART aplikasi tidak boleh ikut masuk state permanen hanya karena framing,
+     * TXE interrupt, atau transient register state.
+     */
+    SET_BIT(USART2->CR1, USART_CR1_UE | USART_CR1_TE | USART_CR1_RE | USART_CR1_RXNEIE);
+    HAL_NVIC_EnableIRQ(USART2_IRQn);
+
+    if (uart_tx_busy_flag) {
+        uint32_t age_us = (uint32_t)(board_micros() - uart_tx_started_us);
+        if (age_us > 5000U) {
+            uart_cancel_async_tx();
+        }
+    } else {
+        CLEAR_BIT(USART2->CR1, USART_CR1_TXEIE);
+    }
 }
 
 void USART2_IRQHandler(void)
@@ -355,6 +383,7 @@ void USART2_IRQHandler(void)
         if (uart_tx_index >= uart_tx_len) {
             CLEAR_BIT(USART2->CR1, USART_CR1_TXEIE);
             uart_tx_busy_flag = 0U;
+            uart_tx_started_us = 0U;
         }
     }
 }

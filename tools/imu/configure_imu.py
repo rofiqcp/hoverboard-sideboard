@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 import argparse,math,struct,time,serial
 from read_imu import crc16,read_frame
-from serial_common import find_sideboard_port,open_sideboard_port
+from serial_common import open_sideboard_port
 COMM=0xF3; BAUD=921600
-SUB={"get":1,"mount-rpy":2,"thermal":3,"lever":4,"clear-thermal":5,"reset-mount":6,"noise":7,"accel-cal":8}
+SUB={"get":1,"mount-rpy":2,"thermal":3,"lever":4,"clear-thermal":5,"reset-mount":6,"noise":7,"accel-cal":8,"output-map":9,"reset-all":10}
 
 def packet(p):
     c=crc16(p); return bytes((2,len(p)))+p+bytes((c>>8,c&255,3))
@@ -11,16 +11,17 @@ def packet(p):
 def decode(p,sub):
     if not p or p[0]!=COMM or len(p)<3 or p[1]!=sub:return None
     if len(p)==3:return {"status":p[2]}
-    if len(p) not in (59,79,127):return None
+    if len(p) not in (59,79,127,129):return None
     vals=struct.unpack(">BBB4i3i3i3iI",p[:59]); out={"status":vals[2]}
     out["q"]=tuple(x/1e6 for x in vals[3:7]); out["gs"]=tuple(x/1e6 for x in vals[7:10])
     out["a"]=tuple(x/1e6 for x in vals[10:13]); out["lever"]=tuple(x/1000 for x in vals[13:16]); out["flags"]=vals[16]
     out["noise"]=tuple(x/1e6 for x in struct.unpack(">5i",p[59:79])) if len(p)>=79 else None
-    out["accel_offset"]=tuple(x/1e6 for x in struct.unpack(">3i",p[79:91])) if len(p)==127 else None
-    out["accel_matrix"]=tuple(x/1e6 for x in struct.unpack(">9i",p[91:127])) if len(p)==127 else None
+    out["accel_offset"]=tuple(x/1e6 for x in struct.unpack(">3i",p[79:91])) if len(p)>=127 else None
+    out["accel_matrix"]=tuple(x/1e6 for x in struct.unpack(">9i",p[91:127])) if len(p)>=127 else None
+    out["output_map"]=struct.unpack(">H",p[127:129])[0] if len(p)>=129 else 0
     return out
 
-def request(req,sub,portname,baud,overall=8.0):
+def request(req,sub,portname,baud,overall=15.0):
     deadline=time.monotonic()+overall; last=None
     while time.monotonic()<deadline:
         try:
@@ -38,7 +39,7 @@ def request(req,sub,portname,baud,overall=8.0):
 def main():
     ap=argparse.ArgumentParser(description="Konfigurasi mounting/thermal/lever/noise IMU dengan retry startup")
     ap.add_argument("command",nargs="?",choices=SUB,default="get");ap.add_argument("values",nargs="*",type=float)
-    ap.add_argument("--port",default="auto");ap.add_argument("--baud",type=int,default=BAUD);a=ap.parse_args();v=a.values;sub=SUB[a.command]
+    ap.add_argument("--port",default="auto");ap.add_argument("--baud",type=int,default=BAUD);ap.add_argument("--overall-timeout",type=float,default=15.0);a=ap.parse_args();v=a.values;sub=SUB[a.command]
     req=bytes((COMM,sub))
     if a.command=="mount-rpy":
         if len(v)!=3:ap.error("mount-rpy butuh roll pitch yaw derajat")
@@ -55,9 +56,12 @@ def main():
     elif a.command=="accel-cal":
         if len(v)!=12:ap.error("accel-cal butuh offset xyz lalu matrix 3x3 row-major (12 nilai)")
         req+=struct.pack(">12i",*(round(x*1e6) for x in v))
+    elif a.command=="output-map":
+        if len(v)!=1 or int(v[0])!=v[0] or not 0<=int(v[0])<=15:ap.error("output-map butuh mask integer 0..15")
+        req+=bytes((int(v[0]),))
     elif v:ap.error("command ini tidak menerima values")
-    port=find_sideboard_port(a.port);print(f"Sideboard: {port} @ {a.baud}")
-    try:d=request(req,sub,port,a.baud)
+    print(f"Sideboard target: {a.port} @ {a.baud}")
+    try:d=request(req,sub,a.port,a.baud,max(a.overall_timeout,1.0))
     except TimeoutError as e:print("ERROR:",e);return 3
     print(f"status={d['status']}")
     if "q" in d:
@@ -68,5 +72,8 @@ def main():
         if d.get("accel_offset"):
             print("accel_offset_mps2=",d["accel_offset"]); m=d["accel_matrix"]; print("accel_transform=")
             for r in range(3): print(" ",m[3*r:3*r+3])
+        om=d.get("output_map",0); print(f"output_map=0x{om:02X} invertX={bool(om&1)} invertY={bool(om&2)} invertZ={bool(om&4)} swapRP={bool(om&8)}")
     return 0 if d["status"]==0 else 2
-if __name__=="__main__":raise SystemExit(main())
+if __name__=="__main__":
+    from run_csv import run_logged
+    raise SystemExit(run_logged(main,__file__))

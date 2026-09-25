@@ -50,7 +50,7 @@ Payload command `0xF0` versi 1 berisi:
 Baca dari Linux:
 
 ```bash
-python3 tools/read_imu.py \
+python3 tools/imu/read_imu.py \
   --port /dev/serial/by-id/usb-1a86_USB_Serial-if00-port0 \
   --baud 921600
 ```
@@ -82,7 +82,7 @@ Bootloader memakai USART2 921600 baud dan framing VESC yang sama. Command yang t
 Tool host:
 
 ```bash
-python3 tools/flash_uart.py .pio/build/APP_STLINK/firmware.bin
+python3 tools/imu/flash_uart.py .pio/build/APP_STLINK/firmware.bin
 ```
 
 Bootloader normal memberi jendela sekitar 1,5 detik setelah reset. Update melalui aplikasi tidak perlu reset manual: command `0xF1` menyimpan recovery latch di backup register lalu software-reset, sehingga bootloader tetap aktif sampai `GO` berhasil.
@@ -104,7 +104,7 @@ Pada sesi Tahap 2 pernah terjadi USB hub host error Linux `-71` yang memutus sel
 
 ## Upload firmware melalui USART
 
-Aplikasi dan bootloader sama-sama memakai USART2 921600 baud. Tool `tools/flash_uart.py` otomatis:
+Aplikasi dan bootloader sama-sama memakai USART2 921600 baud. Tool `tools/imu/flash_uart.py` otomatis:
 
 1. mencoba mendeteksi bootloader;
 2. bila aplikasi sedang aktif, mengirim command `ENTER_BOOTLOADER` (`0xF1`);
@@ -141,19 +141,19 @@ Port serial dipilih otomatis: firmware/tool memprioritaskan `/dev/serial/by-id/u
 
 ```bash
 # Baca data terus-menerus tanpa menulis nama port
-python3 tools/read_imu.py
+python3 tools/imu/read_imu.py
 
 # Console live + command kalibrasi interaktif
-python3 tools/calibrate_imu.py
+python3 tools/imu/calibrate_imu.py
 
 # Kalibrasi gyro saat board benar-benar diam, tunggu sampai DONE dan auto-save EEPROM
-python3 tools/calibrate_imu.py still
+python3 tools/imu/calibrate_imu.py still
 
 # Wizard kalibrasi accelerometer enam sisi (+X,-X,+Y,-Y,+Z,-Z)
-python3 tools/calibrate_imu.py rotate-start
+python3 tools/imu/calibrate_imu.py rotate-start
 
 # Status kalibrasi
-python3 tools/calibrate_imu.py status
+python3 tools/imu/calibrate_imu.py status
 
 # Upload aplikasi tanpa ST-LINK
 pio run -e APP_USART -t upload
@@ -203,21 +203,21 @@ Alur kalibrasi accelerometer enam sisi sekarang memakai model `a_corrected = T *
 Command konfigurasi privat tetap memakai framing+CRC VESC:
 
 ```bash
-python3 tools/configure_imu.py get
-python3 tools/configure_imu.py mount-rpy ROLL PITCH YAW
-python3 tools/configure_imu.py lever X Y Z
-python3 tools/configure_imu.py thermal GX GY GZ AX AY AZ
-python3 tools/configure_imu.py clear-thermal
-python3 tools/configure_imu.py reset-mount
+python3 tools/imu/configure_imu.py get
+python3 tools/imu/configure_imu.py mount-rpy ROLL PITCH YAW
+python3 tools/imu/configure_imu.py lever X Y Z
+python3 tools/imu/configure_imu.py thermal GX GY GZ AX AY AZ
+python3 tools/imu/configure_imu.py clear-thermal
+python3 tools/imu/configure_imu.py reset-mount
 ```
 
 External aiding menggunakan command `0xF4`, timestamp MCU opsional, sigma measurement, absolute input/range guards, innovation/NIS gate, dan source reacquisition reset. Contoh:
 
 ```bash
-python3 tools/aiding_imu.py wheel 1.0 --sigma 0.05 --nhc
-python3 tools/aiding_imu.py world-vel 1.0 0.0 0.0 --sigma 0.10
-python3 tools/aiding_imu.py world-pos 2.0 1.0 0.0 --sigma 0.25
-python3 tools/aiding_imu.py yaw 90 --sigma 2
+python3 tools/imu/aiding_imu.py wheel 1.0 --sigma 0.05 --nhc
+python3 tools/imu/aiding_imu.py world-vel 1.0 0.0 0.0 --sigma 0.10
+python3 tools/imu/aiding_imu.py world-pos 2.0 1.0 0.0 --sigma 0.25
+python3 tools/imu/aiding_imu.py yaw 90 --sigma 2
 ```
 
 Wheel aiding mengobservasi body-forward velocity; NHC menahan body lateral/vertical velocity. Lever arm memakai koreksi `omega x r`. World velocity, world position, dan yaw memakai source reset ketika pertama acquire/ketika source timeout, lalu innovation fusion normal sesudah lock. Ini mencegah estimator menolak heading/velocity awal yang jauh dari state IMU-only.
@@ -231,25 +231,25 @@ Safety ESKF Tahap 2 mencakup finite/range guards, absolute innovation guards, NI
 Logger resmi untuk data calibration/noise:
 
 ```bash
-python3 tools/imu_log.py --duration 120 --output records/still.csv
+python3 tools/imu/imu_log.py --duration 120 --output records/still.csv
 ```
 
 Untuk thermal, ambil beberapa plateau dengan **orientasi board tetap sama** dan temperatur berbeda, lalu fit:
 
 ```bash
-python3 tools/thermal_calibration.py records/t25.csv records/t35.csv records/t45.csv
+python3 tools/imu/thermal_calibration.py records/t25.csv records/t35.csv records/t45.csv
 ```
 
 Untuk noise/Q, rekam stationary panjang (disarankan >=10 menit untuk bias walk) lalu:
 
 ```bash
-python3 tools/allan_analysis.py records/still_long.csv --curve-out records/allan.csv
+python3 tools/imu/allan_analysis.py records/still_long.csv --curve-out records/allan.csv
 ```
 
 Untuk accelerometer presisi, gunakan >=12 orientasi diam berbeda dan host ellipsoid fit; runtime firmware tetap memakai matrix 3x3 yang ringan:
 
 ```bash
-python3 tools/accel_ellipsoid_calibration.py records/pose01.csv records/pose02.csv records/pose03.csv ...
+python3 tools/imu/accel_ellipsoid_calibration.py records/pose01.csv records/pose02.csv records/pose03.csv ...
 ```
 
 Six-face firmware tetap tersedia sebagai field-calibration sederhana. Tool host hanya memberi rekomendasi/aplikasi jika quality gate lolos; log terlalu pendek ditolak.
@@ -261,8 +261,8 @@ Command `0xF4` sekarang memiliki kontrak eksplisit: `body`, `local Z-up`, atau `
 Contoh:
 
 ```bash
-python3 tools/aiding_imu.py yaw 90 --frame enu --age-ms 20 --sigma 2
-python3 tools/aiding_imu.py world-vel 1 0 0 --frame enu --age-ms 20 --sigma 0.10
+python3 tools/imu/aiding_imu.py yaw 90 --frame enu --age-ms 20 --sigma 2
+python3 tools/imu/aiding_imu.py world-vel 1 0 0 --frame enu --age-ms 20 --sigma 0.10
 ```
 
 Regression host dapat dijalankan tanpa board:

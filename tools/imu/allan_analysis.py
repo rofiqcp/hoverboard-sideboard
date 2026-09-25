@@ -2,6 +2,7 @@
 """Allan-deviation analysis for long stationary IMU logs."""
 import argparse,csv,math
 import numpy as np
+from tool_paths import log_input,log_output,display_path
 COLS=["gx_rads","gy_rads","gz_rads","ax_mps2","ay_mps2","az_mps2"]
 
 def load(path):
@@ -45,9 +46,15 @@ def estimate(curve):
     return white,bias,rw,slope
 
 def main():
-    ap=argparse.ArgumentParser(description="Allan deviation dari log stationary panjang")
-    ap.add_argument("file"); ap.add_argument("--curve-out",default=None); a=ap.parse_args()
-    fs,temp,d=load(a.file); dur=len(temp)/fs
+    ap=argparse.ArgumentParser(description="Allan deviation dari log stationary panjang di tools/logs/")
+    ap.add_argument("file",help="CSV relatif di tools/logs/")
+    ap.add_argument("--curve-out",default="auto",help="nama CSV curve relatif; default auto")
+    a=ap.parse_args()
+    try:
+        infile=log_input(a.file)
+        curve_out=log_output(a.curve_out,f"allan_curve_{infile.stem}") if a.curve_out else None
+    except (ValueError,FileNotFoundError) as e: ap.error(str(e))
+    fs,temp,d=load(infile); dur=len(temp)/fs
     print(f"samples={len(temp)} fs={fs:.3f}Hz duration={dur/60:.1f}min temp={temp.min():.2f}..{temp.max():.2f}C span={np.ptp(temp):.2f}C")
     if np.ptp(temp)>2.0: print("WARNING: temperature span >2C; bias/long-tau Allan tercampur thermal drift")
     curves={}; est={}
@@ -60,11 +67,13 @@ def main():
     print(f"recommended gyro_noise~{gnoise:.6g}, accel_process_noise~{anoise:.6g}")
     if dur>=600 and gbias is not None and abias is not None: print(f"candidate bias_walk gyro~{gbias:.6g}, accel~{abias:.6g} (verify curve before applying)")
     else: print("bias_walk: log >=10 min diperlukan; jangan ubah dari log pendek")
-    if a.curve_out:
-        with open(a.curve_out,"w",newline="") as f:
+    if curve_out:
+        with open(curve_out,"w",newline="") as f:
             w=csv.writer(f); w.writerow(["signal","tau_s","allan_dev"])
             for k,c in curves.items():
                 for tau,v in c:w.writerow([k,tau,v])
-        print("curve saved:",a.curve_out)
+        print("curve saved:",display_path(curve_out))
     return 0
-if __name__=="__main__": raise SystemExit(main())
+if __name__=="__main__":
+    from run_csv import run_logged
+    raise SystemExit(run_logged(main,__file__))

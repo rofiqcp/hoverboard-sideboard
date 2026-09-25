@@ -126,7 +126,7 @@ static int update1_sparse(EskfNav *f,
                           const uint8_t *h_index, const float *h_value, uint8_t h_count,
                           float innov, float variance, float nis_gate,
                           const float gravity_axis[3], uint8_t accel_bias_mode,
-                          uint8_t gyro_bias_mode)
+                          uint8_t gyro_bias_mode, uint8_t suppress_position_correction)
 {
     if (!f || !h_index || !h_value || h_count==0U || h_count>ESKF_NAV_DIM ||
         !isfinite(innov) || !isfinite(variance) || !(variance>0.0f)) return 0;
@@ -164,6 +164,16 @@ static int update1_sparse(EskfNav *f,
     }
     if (gyro_bias_mode==0U) {
         for (int i=0;i<3;i++) K[IDX_BG+i]=0.0f;
+    }
+    if (suppress_position_correction) {
+        /*
+         * Velocity/zero-rate constraints do not observe absolute position.
+         * Cross-covariance may be large after long dead-reckoning; letting that
+         * gain inject into position causes artificial metre-scale jumps while
+         * the board is perfectly stationary. Zero Kp keeps the Joseph update
+         * and nominal correction mutually consistent.
+         */
+        for (int i=0;i<3;i++) K[IDX_P+i]=0.0f;
     }
 
     /* Batasi satu correction step dengan menskalakan gain, bukan sekadar dx.
@@ -399,7 +409,7 @@ int eskf_nav_correct_gravity(EskfNav *f, const float accel[3], int stationary)
         float h_value[3]={sh[axis][0],sh[axis][1],sh[axis][2]};
 
         if (!update1_sparse(f,h_index,h_value,3U,innov,sigma*sigma,
-                            ESKF_GRAVITY_SCALAR_NIS_GATE,h,0U,2U)) {
+                            ESKF_GRAVITY_SCALAR_NIS_GATE,h,0U,2U,1U)) {
             f->gravity_reject_count++;
             continue;
         }
@@ -418,7 +428,7 @@ int eskf_nav_fuse_zero_velocity(EskfNav *f,float sigma)
         const uint8_t h_index[3]={(uint8_t)(IDX_V+axis),0U,0U};
         const float h_value[3]={1.0f,0.0f,0.0f};
         if (update1_sparse(f,h_index,h_value,1U,-f->velocity[axis],sigma*sigma,0.0f,
-                           gravity_axis,1U,2U)) fused++;
+                           gravity_axis,1U,2U,1U)) fused++;
     }
     if (fused==3) { f->zupt_count++; return 1; }
     return 0;
@@ -431,7 +441,7 @@ int eskf_nav_fuse_zero_rate(EskfNav *f,const float gyro[3],float sigma)
         const uint8_t h_index[3]={(uint8_t)(IDX_BG+axis),0U,0U};
         const float h_value[3]={1.0f,0.0f,0.0f};
         float innov=gyro[axis]-f->gyro_bias[axis];
-        if (update1_sparse(f,h_index,h_value,1U,innov,sigma*sigma,0.0f,0,0U,2U)) fused++;
+        if (update1_sparse(f,h_index,h_value,1U,innov,sigma*sigma,0.0f,0,0U,2U,1U)) fused++;
     }
     if (fused==3) { f->zero_rate_count++; return 1; }
     return 0;
@@ -457,7 +467,7 @@ int eskf_nav_fuse_world_velocity(EskfNav *f,const float velocity[3],float sigma)
     for(int axis=0;axis<3;axis++){
         const uint8_t hi[1]={(uint8_t)(IDX_V+axis)};
         const float hv[1]={1.0f};
-        if(update1_sparse(f,hi,hv,1U,velocity[axis]-f->velocity[axis],sigma*sigma,9.0f,0,2U,2U))fused++;
+        if(update1_sparse(f,hi,hv,1U,velocity[axis]-f->velocity[axis],sigma*sigma,9.0f,0,2U,2U,0U))fused++;
     }
     return fused==3;
 }
@@ -473,7 +483,7 @@ int eskf_nav_fuse_world_position(EskfNav *f,const float position[3],float sigma)
     for(int axis=0;axis<3;axis++){
         const uint8_t hi[1]={(uint8_t)(IDX_P+axis)};
         const float hv[1]={1.0f};
-        if(update1_sparse(f,hi,hv,1U,position[axis]-f->position[axis],sigma*sigma,9.0f,0,2U,2U))fused++;
+        if(update1_sparse(f,hi,hv,1U,position[axis]-f->position[axis],sigma*sigma,9.0f,0,2U,2U,0U))fused++;
     }
     return fused==3;
 }
@@ -501,7 +511,7 @@ int eskf_nav_fuse_body_velocity(EskfNav *f,const float velocity_body[3],uint8_t 
         float hv[6]={sv[axis][0],sv[axis][1],sv[axis][2],
                      R[0][axis],R[1][axis],R[2][axis]};
         if(update1_sparse(f,hi,hv,6U,velocity_body[axis]-pred_body[axis],
-                          sigma*sigma,9.0f,0,2U,2U))fused++;
+                          sigma*sigma,9.0f,0,2U,2U,0U))fused++;
     }
     return requested>0 && fused==requested;
 }
@@ -515,7 +525,7 @@ int eskf_nav_fuse_yaw(EskfNav *f,float yaw_rad,float sigma)
     const uint8_t hi[3]={IDX_TH,IDX_TH+1,IDX_TH+2};
     float innov=wrap_pi(yaw_rad-current);
     if(fabsf(innov)>AID_YAW_INNOV_MAX_RAD)return 0;
-    return update1_sparse(f,hi,gbody,3U,innov,sigma*sigma,AID_YAW_NIS_GATE,0,0U,0U);
+    return update1_sparse(f,hi,gbody,3U,innov,sigma*sigma,AID_YAW_NIS_GATE,0,0U,0U,0U);
 }
 
 static void reset_state_covariance_block(EskfNav *f,int start,float variance)

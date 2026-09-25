@@ -3,7 +3,7 @@
 import argparse, struct, time
 import serial
 from read_imu import crc16, read_frame
-from serial_common import find_sideboard_port, open_sideboard_port
+from serial_common import open_sideboard_port
 
 COMM=0xF4; BAUD=921600
 TYPES={"wheel":1,"world-vel":2,"world-pos":3,"yaw":4}
@@ -60,27 +60,30 @@ def main():
     ap.add_argument("--sigma",type=float,default=None)
     tg=ap.add_mutually_exclusive_group(); tg.add_argument("--age-ms",type=float,default=None); tg.add_argument("--board-timestamp",type=int,default=None)
     ap.add_argument("--frame",choices=("local","enu"),default="local"); ap.add_argument("--nhc",action="store_true")
-    ap.add_argument("--port",default="auto"); ap.add_argument("--baud",type=int,default=BAUD); ap.add_argument("--retries",type=int,default=4)
+    ap.add_argument("--port",default="auto"); ap.add_argument("--baud",type=int,default=BAUD); ap.add_argument("--retries",type=int,default=4); ap.add_argument("--overall-timeout",type=float,default=15.0)
     a=ap.parse_args(); typ=TYPES[a.command]
     request_id=(time.monotonic_ns() ^ (time.time_ns()>>16)) & 0xffff
     if request_id==0: request_id=1
     try: payload,timing,frame=build_payload(a,typ,request_id)
     except ValueError as e: ap.error(str(e))
-    pkt=packet(payload); portname=find_sideboard_port(a.port)
-    print(f"Sideboard: {portname} @ {a.baud} | timing={timing} frame={frame} req={request_id}")
-    last_error=None
-    for session in range(3):
+    pkt=packet(payload)
+    print(f"Sideboard target: {a.port} @ {a.baud} | timing={timing} frame={frame} req={request_id}")
+    last_error=None; deadline=time.monotonic()+max(a.overall_timeout,1.0); session=0
+    while time.monotonic()<deadline:
+        session+=1
         try:
-            with open_sideboard_port(portname,a.baud,timeout=.03,attempts=5,delay=.08) as port:
+            with open_sideboard_port(a.port,a.baud,timeout=.03,attempts=3,delay=.10) as port:
                 time.sleep(.025); port.reset_input_buffer()
                 r=transact(port,pkt,typ,request_id,max(1,a.retries))
                 if r:
                     status=r[2]; age=(r[3]<<8)|r[4]
-                    print(f"aid status={status} ({STATUS.get(status,'unknown')}) age={age} ms")
+                    print(f"aid status={status} ({STATUS.get(status,'unknown')}) age={age} ms sessions={session}")
                     return 0 if status==0 else 2
         except (serial.SerialException,OSError,FileNotFoundError) as e:
             last_error=e
-        time.sleep(.08)
+        time.sleep(.10)
     print(f"ERROR: timeout menunggu ACK aiding req={request_id} {last_error or ''}",flush=True); return 3
 
-if __name__=="__main__": raise SystemExit(main())
+if __name__=="__main__":
+    from run_csv import run_logged
+    raise SystemExit(run_logged(main,__file__))

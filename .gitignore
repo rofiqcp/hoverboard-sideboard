@@ -17,3 +17,9 @@ MDK-ARM/*.uvguix.*
 # Python cache
 __pycache__/
 *.py[cod]
+
+# Runtime IMU logs (portable relative path)
+tools/logs/*.csv
+tools/logs/run/*.csv
+!tools/logs/.gitkeep
+!tools/logs/run/.gitkeep

@@ -7,10 +7,12 @@ lalu menampilkan data mentah MPU6xxx dan hasil attitude ESKF.
 
 import argparse
 import struct
+import sys
 import time
 import serial
 import weakref
 from serial_common import find_sideboard_port, open_sideboard_port
+from flash_uart import catch_bootloader,parse_info,transact,CMD_GO
 
 PORT_DEFAULT = "auto"
 BAUD_DEFAULT = 921600
@@ -172,37 +174,67 @@ def main():
                         help="Tampilkan tiap N frame; default 5 = sekitar 10 Hz dari stream 50 Hz")
     parser.add_argument("--count", type=int, default=0,
                         help="Berhenti setelah jumlah frame valid ini; 0 berarti terus")
+    parser.add_argument("--mode", choices=("raw","ready","all"), default="all",
+                        help="raw=sensor mentah, ready=data siap pakai, all=diagnostik lengkap")
     args = parser.parse_args()
 
-    valid = crc_errors = other_errors = 0
-    last_seq = None
-    lost = 0
-    first_time_us = None
-    last_time_us = None
+    valid = crc_errors = other_errors = lost = reconnects = reboots = 0
+    last_seq = last_time_us = None
+    sensor_elapsed_us = seq_advance_total = 0
     started = time.monotonic()
-
-    selected_port = find_sideboard_port(args.port)
-    with open_sideboard_port(selected_port, args.baud, timeout=0.05) as port:
-        port.reset_input_buffer()
-        print(f"Membaca {selected_port} @ {args.baud} baud ...")
-        try:
-            while args.count == 0 or valid < args.count:
+    interrupted = False
+    last_rx_host = time.monotonic()
+    last_notice = 0.0
+    last_boot_probe = 0.0
+    port = None
+    try:
+        while args.count == 0 or valid < args.count:
+            try:
+                if port is None or not port.is_open:
+                    port = open_sideboard_port(args.port, args.baud, timeout=0.05,
+                                               attempts=5, delay=0.20)
+                    port.reset_input_buffer()
+                    print(f"Membaca {port.port} @ {args.baud} baud ..."
+                          + (" (reconnect)" if reconnects else ""))
                 payload, error = read_frame(port)
                 if error:
                     if error == "crc": crc_errors += 1
                     elif error != "timeout": other_errors += 1
+                    if error == "timeout":
+                        now=time.monotonic()
+                        if now-last_rx_host > 2.0 and now-last_notice > 2.0:
+                            print(f"COM {port.port} terbuka, tetapi STM32 belum mengirim telemetry; tetap menunggu ...",
+                                  file=sys.stderr)
+                            last_notice=now
+                        if now-last_rx_host > 2.0 and now-last_boot_probe > 3.0:
+                            last_boot_probe=now
+                            try:
+                                info=catch_bootloader(port,.40)
+                                version,start,end,page,chunk,app_valid=parse_info(info)
+                                if app_valid:
+                                    print(f"Bootloader v{version} terdeteksi; GO otomatis ke aplikasi ...",
+                                          file=sys.stderr)
+                                    transact(port,bytes((CMD_GO,)),CMD_GO,timeout=.8)
+                                    port.close(); port=None
+                                    time.sleep(.45)
+                            except TimeoutError:
+                                pass
                     continue
                 data = decode_imu(payload)
                 if data is None:
                     continue
+                last_rx_host=time.monotonic()
 
-                if last_seq is not None:
-                    delta = (data["seq"] - last_seq) & 0xFFFFFFFF
-                    if delta > 1:
-                        lost += delta - 1
+                if last_seq is not None and last_time_us is not None:
+                    dseq = (data["seq"] - last_seq) & 0xFFFFFFFF
+                    dt_us = (data["time_us"] - last_time_us) & 0xFFFFFFFF
+                    if 0 < dseq < 0x80000000 and 0 < dt_us < 0x80000000:
+                        if dseq > 1: lost += dseq - 1
+                        seq_advance_total += dseq
+                        sensor_elapsed_us += dt_us
+                    else:
+                        reboots += 1
                 last_seq = data["seq"]
-                if first_time_us is None:
-                    first_time_us = data["time_us"]
                 last_time_us = data["time_us"]
                 valid += 1
 
@@ -212,34 +244,68 @@ def main():
                     ag = (ax / 8192.0, ay / 8192.0, az / 8192.0)
                     gd = (gx / 65.5, gy / 65.5, gz / 65.5)
                     temp_c = data["temp_c"]
-                    print(
-                        f"seq={data['seq']:8d} t={data['time_us']:10d}us "
-                        f"RPY=({data['roll']:8.3f},{data['pitch']:8.3f},{data['yaw']:8.3f})deg "
-                        f"Araw=({ax:6d},{ay:6d},{az:6d}) "
-                        f"Graw=({gx:6d},{gy:6d},{gz:6d}) Traw={data['temp_raw']:6d} "
-                        f"A[g]=({ag[0]:+.3f},{ag[1]:+.3f},{ag[2]:+.3f}) "
-                        f"G[dps]=({gd[0]:+.2f},{gd[1]:+.2f},{gd[2]:+.2f}) "
-                        f"V=({data['vel'][0]:+.3f},{data['vel'][1]:+.3f},{data['vel'][2]:+.3f})m/s "
-                        f"P=({data['pos'][0]:+.3f},{data['pos'][1]:+.3f},{data['pos'][2]:+.3f})m "
-                        f"stdV=({data['vel_std'][0]:.3f},{data['vel_std'][1]:.3f},{data['vel_std'][2]:.3f}) "
-                        f"aid_age={data['aid_age_ms']}ms rej={data['aid_reject']} "
-                        f"T={temp_c:.2f}C imu=0x{data['imu_whoami']:02X}/c{data['imu_class']} rate={data['observed_sample_hz']:.2f}Hz "
-                        f"flags=0x{data['flags']:04X} [{flag_text(data['flags'])}] "
-                        f"nav=0x{data['nav_status']:02X}[{nav_text(data['nav_status'])}] resets={data['health_resets']}"
-                    )
-        except KeyboardInterrupt:
-            pass
+                    if args.mode == "raw":
+                        print(
+                            f"RAW seq={data['seq']:8d} t={data['time_us']:10d}us "
+                            f"Araw=({ax:6d},{ay:6d},{az:6d}) "
+                            f"Graw=({gx:6d},{gy:6d},{gz:6d}) Traw={data['temp_raw']:6d} "
+                            f"A[g]=({ag[0]:+.4f},{ag[1]:+.4f},{ag[2]:+.4f}) "
+                            f"G[dps]=({gd[0]:+.3f},{gd[1]:+.3f},{gd[2]:+.3f}) "
+                            f"T={temp_c:.2f}C sample={data['observed_sample_hz']:.2f}Hz"
+                        )
+                    elif args.mode == "ready":
+                        print(
+                            f"READY seq={data['seq']:8d} "
+                            f"RPY=({data['roll']:+8.3f},{data['pitch']:+8.3f},{data['yaw']:+8.3f})deg "
+                            f"LinAcc=({data['linacc'][0]:+.3f},{data['linacc'][1]:+.3f},{data['linacc'][2]:+.3f})m/s2 "
+                            f"V=({data['vel'][0]:+.3f},{data['vel'][1]:+.3f},{data['vel'][2]:+.3f})m/s "
+                            f"P=({data['pos'][0]:+.3f},{data['pos'][1]:+.3f},{data['pos'][2]:+.3f})m "
+                            f"stdV=({data['vel_std'][0]:.3f},{data['vel_std'][1]:.3f},{data['vel_std'][2]:.3f}) "
+                            f"T={temp_c:.2f}C flags=[{flag_text(data['flags'])}] "
+                            f"nav=[{nav_text(data['nav_status'])}] resets={data['health_resets']}"
+                        )
+                    else:
+                        print(
+                            f"seq={data['seq']:8d} t={data['time_us']:10d}us "
+                            f"RPY=({data['roll']:8.3f},{data['pitch']:8.3f},{data['yaw']:8.3f})deg "
+                            f"Araw=({ax:6d},{ay:6d},{az:6d}) "
+                            f"Graw=({gx:6d},{gy:6d},{gz:6d}) Traw={data['temp_raw']:6d} "
+                            f"A[g]=({ag[0]:+.3f},{ag[1]:+.3f},{ag[2]:+.3f}) "
+                            f"G[dps]=({gd[0]:+.2f},{gd[1]:+.2f},{gd[2]:+.2f}) "
+                            f"LinAcc=({data['linacc'][0]:+.3f},{data['linacc'][1]:+.3f},{data['linacc'][2]:+.3f})m/s2 "
+                            f"V=({data['vel'][0]:+.3f},{data['vel'][1]:+.3f},{data['vel'][2]:+.3f})m/s "
+                            f"P=({data['pos'][0]:+.3f},{data['pos'][1]:+.3f},{data['pos'][2]:+.3f})m "
+                            f"stdV=({data['vel_std'][0]:.3f},{data['vel_std'][1]:.3f},{data['vel_std'][2]:.3f}) "
+                            f"aid_age={data['aid_age_ms']}ms rej={data['aid_reject']} "
+                            f"T={temp_c:.2f}C imu=0x{data['imu_whoami']:02X}/c{data['imu_class']} rate={data['observed_sample_hz']:.2f}Hz "
+                            f"flags=0x{data['flags']:04X} [{flag_text(data['flags'])}] "
+                            f"nav=0x{data['nav_status']:02X}[{nav_text(data['nav_status'])}] resets={data['health_resets']}"
+                        )
+            except (serial.SerialException, OSError, FileNotFoundError) as exc:
+                reconnects += 1
+                if port is not None:
+                    try: port.close()
+                    except Exception: pass
+                port = None
+                print(f"Serial terputus ({exc}); menunggu COM kembali ...", file=sys.stderr)
+                time.sleep(0.20)
+    except KeyboardInterrupt:
+        interrupted = True
+    finally:
+        if port is not None:
+            try: port.close()
+            except Exception: pass
 
     elapsed = max(time.monotonic() - started, 1e-6)
-    if valid > 1 and first_time_us is not None and last_time_us is not None:
-        sensor_elapsed = ((last_time_us - first_time_us) & 0xFFFFFFFF) * 1.0e-6
-        stream_hz = (valid - 1) / max(sensor_elapsed, 1e-6)
-    else:
-        stream_hz = 0.0
+    stream_hz = seq_advance_total / max(sensor_elapsed_us * 1.0e-6, 1e-6) if sensor_elapsed_us else 0.0
     print(f"Ringkasan: valid={valid}, hilang_seq={lost}, crc_error={crc_errors}, "
-          f"error_lain={other_errors}, stream={stream_hz:.1f} Hz, "
-          f"laju_host_total={valid/elapsed:.1f} frame/s")
+          f"error_lain={other_errors}, reconnect={reconnects}, reboot/reset={reboots}, "
+          f"stream={stream_hz:.1f} Hz, laju_host_total={valid/elapsed:.1f} frame/s")
+    if interrupted:
+        raise KeyboardInterrupt
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    from run_csv import run_logged
+    raise SystemExit(run_logged(main,__file__))

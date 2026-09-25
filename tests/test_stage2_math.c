@@ -23,6 +23,53 @@ int main(void){
     ck(vn<0.01f,"stationary velocity bounded <1 cm/s");
     ck(pn<0.05f,"stationary position bounded <5 cm");
 
+    /* Gravity direction has no absolute-position information either.
+     * A large theta-position cross covariance must not move the local origin. */
+    eskf_nav_init(&f,a0);
+    f.position[0]=8.0f; f.position[1]=-4.0f; f.position[2]=2.0f;
+    for(int i=0;i<3;i++) {
+        f.P[6+i][i]=0.010f; f.P[i][6+i]=0.010f;
+    }
+    {
+        float p_before_g[3]={f.position[0],f.position[1],f.position[2]};
+        float atilt[3]={0.02f*g,-0.015f*g,0.999687f*g};
+        (void)eskf_nav_correct_gravity(&f,atilt,1);
+        ck(fabsf(f.position[0]-p_before_g[0])<1e-6f &&
+           fabsf(f.position[1]-p_before_g[1])<1e-6f &&
+           fabsf(f.position[2]-p_before_g[2])<1e-6f,
+           "gravity correction never injects absolute position jump");
+    }
+
+    /* A zero-velocity observation has no absolute-position information.
+     * Even with a large valid v-p cross covariance it must not teleport the
+     * position estimate. This reproduces the field failure where stationary
+     * ZUPT moved pz by tens of metres per update. */
+    eskf_nav_init(&f,a0);
+    f.velocity[0]=1.0f; f.velocity[1]=-0.8f; f.velocity[2]=0.6f;
+    f.position[0]=12.0f; f.position[1]=-7.0f; f.position[2]=3.0f;
+    for(int i=0;i<3;i++) {
+        f.P[6+i][3+i]=0.019f; f.P[3+i][6+i]=0.019f;
+    }
+    float p_hold[3]={f.position[0],f.position[1],f.position[2]};
+    ck(eskf_nav_fuse_zero_velocity(&f,0.03f),"ZUPT accepts large velocity innovation");
+    ck(fabsf(f.position[0]-p_hold[0])<1e-6f &&
+       fabsf(f.position[1]-p_hold[1])<1e-6f &&
+       fabsf(f.position[2]-p_hold[2])<1e-6f,
+       "ZUPT never injects absolute position jump");
+    {
+        float p_before_reset[3]={f.position[0],f.position[1],f.position[2]};
+        float zero_v[3]={0,0,0};
+        ck(eskf_nav_reset_world_velocity(&f,zero_v,0.03f),
+           "confirmed-rest hard zero velocity accepted");
+        ck(fabsf(f.velocity[0])<1e-7f && fabsf(f.velocity[1])<1e-7f &&
+           fabsf(f.velocity[2])<1e-7f,
+           "confirmed-rest velocity reset is exact");
+        ck(fabsf(f.position[0]-p_before_reset[0])<1e-6f &&
+           fabsf(f.position[1]-p_before_reset[1])<1e-6f &&
+           fabsf(f.position[2]-p_before_reset[2])<1e-6f,
+           "confirmed-rest velocity reset preserves position");
+    }
+
     /* FIFO can legally deliver up to ~40 ms of preintegrated data. The estimator
      * must use the same dt as the delta increments, never clamp dt independently. */
     eskf_nav_init(&f,a0);

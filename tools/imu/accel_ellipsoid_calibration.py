@@ -2,6 +2,7 @@
 """Multi-orientation accelerometer ellipsoid fit (host-side, 12+ stationary poses)."""
 import argparse,csv,math,statistics,subprocess,sys
 import numpy as np
+from tool_paths import expand_log_inputs,tool_file,display_path
 from scipy.optimize import least_squares
 G=9.80665
 COLS=("ax_mps2","ay_mps2","az_mps2")
@@ -27,10 +28,12 @@ def residual(p,X):
     b=p[:3];M=matrix_from_p(p);return np.linalg.norm((X-b)@M.T,axis=1)-G
 
 def main():
-    ap=argparse.ArgumentParser(description="Fit symmetric 3x3 accel correction from >=12 stationary orientations")
+    ap=argparse.ArgumentParser(description="Fit symmetric 3x3 accel correction dari CSV relatif di tools/logs/; wildcard didukung")
     ap.add_argument("files",nargs="+");ap.add_argument("--apply",action="store_true");a=ap.parse_args()
-    if len(a.files)<12:raise SystemExit("ERROR: minimal 12 orientation plateau; 18-24 lebih baik")
-    ps=[plateau(f) for f in a.files];X=np.vstack([x[0] for x in ps]);temps=np.array([x[1] for x in ps])
+    try: files=expand_log_inputs(a.files)
+    except (ValueError,FileNotFoundError) as e: ap.error(str(e))
+    if len(files)<12:raise SystemExit("ERROR: minimal 12 orientation plateau; 18-24 lebih baik")
+    ps=[plateau(f) for f in files];X=np.vstack([x[0] for x in ps]);temps=np.array([x[1] for x in ps])
     if np.ptp(temps)>5.0:raise SystemExit(f"ERROR: temperature span {np.ptp(temps):.2f}C >5C; lakukan pada suhu relatif sama / thermal correction dulu")
     U=X/np.linalg.norm(X,axis=1)[:,None];cov=U.T@U/len(U);coverage=float(np.min(np.linalg.eigvalsh(cov)))
     if coverage<0.08:raise SystemExit(f"ERROR: orientation coverage buruk (min eigen={coverage:.4f}); sebar pose ke seluruh sphere")
@@ -44,8 +47,10 @@ def main():
     print("offset m/s2:",*(f"{x:+.8f}" for x in b));print("matrix:")
     for r in M:print(" "," ".join(f"{x:+.9f}" for x in r))
     if rms>0.04*G or mx>0.08*G or cond>3.0 or not (0.2<abs(det)<5.0):raise SystemExit("ERROR: quality gate fit gagal; jangan apply")
-    vals=[*b,*M.reshape(-1)];cmd=[sys.executable,"tools/configure_imu.py","accel-cal",*(f"{x:.10g}" for x in vals)]
+    vals=[*b,*M.reshape(-1)];cmd=[sys.executable,str(tool_file("configure_imu.py")),"accel-cal",*(f"{x:.10g}" for x in vals)]
     print("Command:"," ".join(cmd))
     if a.apply:return subprocess.call(cmd)
     return 0
-if __name__=="__main__":raise SystemExit(main())
+if __name__=="__main__":
+    from run_csv import run_logged
+    raise SystemExit(run_logged(main,__file__))

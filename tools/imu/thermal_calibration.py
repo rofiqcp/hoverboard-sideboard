@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Fit linear IMU thermal slopes from multiple stationary temperature plateaus."""
 import argparse,csv,math,statistics,subprocess,sys
+from tool_paths import expand_log_inputs,tool_file,display_path
 G=9.80665
 AX=("ax_mps2","ay_mps2","az_mps2"); GX=("gx_rads","gy_rads","gz_rads")
 
@@ -25,9 +26,12 @@ def fit(xs,ys):
     return m,b,r2
 
 def main():
-    ap=argparse.ArgumentParser(description="Fit thermal slope; gunakan >=3 plateau dengan board orientasi tetap")
+    ap=argparse.ArgumentParser(description="Fit thermal slope dari CSV relatif di tools/logs/; wildcard didukung")
     ap.add_argument("files",nargs="+"); ap.add_argument("--apply",action="store_true")
-    a=ap.parse_args(); ps=[load_plateau(x) for x in a.files]
+    a=ap.parse_args()
+    try: files=expand_log_inputs(a.files)
+    except (ValueError,FileNotFoundError) as e: ap.error(str(e))
+    ps=[load_plateau(x) for x in files]
     if len(ps)<3: raise SystemExit("ERROR: minimal 3 plateau temperatur")
     temps=[p["temp"] for p in ps]; span=max(temps)-min(temps)
     if span<8.0: raise SystemExit(f"ERROR: temperature span {span:.2f}C < 8C")
@@ -38,15 +42,17 @@ def main():
         if dot<0.995: raise SystemExit(f"ERROR: orientasi berubah pada {p['path']} (dot={dot:.6f})")
     gs=[]; ac=[]
     print("Plateau:")
-    for p in ps: print(f"  {p['path']}: T={p['temp']:.2f}C n={p['n']}")
+    for p in ps: print(f"  {display_path(p['path'])}: T={p['temp']:.2f}C n={p['n']}")
     for i in range(3):
         m,b,r2=fit(temps,[p["g"][i] for p in ps]); gs.append(m); print(f"gyro{i}: {m*180/math.pi:+.6f} deg/s/C R2={r2:.4f}")
     for i in range(3):
         m,b,r2=fit(temps,[p["a"][i] for p in ps]); ac.append(m); print(f"accel{i}: {m:+.6f} m/s2/C R2={r2:.4f}")
     gd=[x*180/math.pi for x in gs]
-    cmd=[sys.executable,"tools/configure_imu.py","thermal",*(f"{x:.9g}" for x in gd),*(f"{x:.9g}" for x in ac)]
+    cmd=[sys.executable,str(tool_file("configure_imu.py")),"thermal",*(f"{x:.9g}" for x in gd),*(f"{x:.9g}" for x in ac)]
     print("Command:"," ".join(cmd))
     if a.apply:
         print("Applying thermal slopes..."); return subprocess.call(cmd)
     return 0
-if __name__=="__main__": raise SystemExit(main())
+if __name__=="__main__":
+    from run_csv import run_logged
+    raise SystemExit(run_logged(main,__file__))

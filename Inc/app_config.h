@@ -75,6 +75,11 @@
 #define ROTATE_CAL_MAX_ERROR_G                0.10f
 #define ROTATE_CAL_COND_FRO_MAX                 6.0f
 #define ZUPT_SIGMA_MPS                      0.03f
+/* Standalone auto-ZUPT boleh re-arm setelah detector benar-benar diam
+ * terus-menerus. Master/ROS tetap authoritative: STATIONARY_OFF mematikan
+ * mekanisme ini, karena IMU tidak dapat membedakan diam dari gerak konstan. */
+#define AUTO_ZUPT_REARM_STILL_SAMPLES          80U
+#define MOTION_AID_RELEASE_SPEED_MPS           0.05f
 #define ZERO_RATE_SIGMA_RAD                 0.008f
 #define NHC_SIGMA_MPS                         0.05f
 #define AID_MAX_AGE_US                      200000UL

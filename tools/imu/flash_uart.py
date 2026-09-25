@@ -191,12 +191,14 @@ def acquire_bootloader(requested, baud, handshake=4.0, overall=35.0):
             port = open_sideboard_port(requested, baud, timeout=0.03, attempts=2, delay=0.10)
             name = port.port
             try:
-                info = catch_bootloader(port, 0.55)
+                probe_s = max(0.20, min(0.75, handshake))
+                info = catch_bootloader(port, probe_s)
                 print(f"Bootloader terdeteksi pada {name} (acquire #{attempt}).")
                 return port, info
             except TimeoutError:
                 try:
-                    ack = request_bootloader_from_app(port, 1.0)
+                    enter_s = max(0.20, min(1.50, handshake))
+                    ack = request_bootloader_from_app(port, enter_s)
                     if ack:
                         print(f"F1 ACK dari aplikasi pada {name}; reopen serial ...")
                 except (serial.SerialException, OSError) as exc:
@@ -310,4 +312,5 @@ def main():
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    from run_csv import run_logged
+    raise SystemExit(run_logged(main,__file__))
