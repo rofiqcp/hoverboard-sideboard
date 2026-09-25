@@ -8,6 +8,15 @@
 #define CAL_FLAG_MOUNT_VALID   (1UL << 2)
 #define CAL_FLAG_THERMAL_VALID (1UL << 3)
 
+/* User-facing output mapping. Stored in PersistedSettings.reserved so the
+ * EEPROM binary format remains backward compatible. ESKF internal frame stays
+ * unchanged; mapping is applied only to telemetry/user outputs. */
+#define OUTPUT_MAP_INVERT_X    (1U << 0)
+#define OUTPUT_MAP_INVERT_Y    (1U << 1)
+#define OUTPUT_MAP_INVERT_Z    (1U << 2)
+#define OUTPUT_MAP_SWAP_RP     (1U << 3)
+#define OUTPUT_MAP_MASK        0x000FU
+
 typedef struct {
     uint32_t magic;
     uint16_t version;

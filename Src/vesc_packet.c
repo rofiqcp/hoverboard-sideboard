@@ -282,6 +282,7 @@ int vesc_send_config_status(UART_HandleTypeDef *uart,uint8_t subcmd,uint8_t stat
         put_i32(payload,&i,sat_i32(s->accel_dir_noise*1000000.0f));
         for(int k=0;k<3;k++)put_i32(payload,&i,sat_i32(s->accel_offset[k]*1000000.0f));
         for(int k=0;k<9;k++)put_i32(payload,&i,sat_i32(s->accel_transform[k]*1000000.0f));
+        put_u16(payload,&i,(uint16_t)(s->reserved & OUTPUT_MAP_MASK));
     }
     return send_payload(uart,payload,i);
 }
@@ -415,8 +416,11 @@ VescAction vesc_process_rx(UART_HandleTypeDef *uart,
             pending_config.subcmd=rx.payload[1];
             if (pending_config.subcmd==CFG_CMD_GET ||
                 pending_config.subcmd==CFG_CMD_CLEAR_THERMAL ||
-                pending_config.subcmd==CFG_CMD_RESET_MOUNT) {
+                pending_config.subcmd==CFG_CMD_RESET_MOUNT ||
+                pending_config.subcmd==CFG_CMD_RESET_ALL) {
                 if(rx.len!=2U){(void)vesc_send_config_status(uart,pending_config.subcmd,2U,0);continue;}
+            } else if (pending_config.subcmd==CFG_CMD_SET_OUTPUT_MAP && rx.len==3U) {
+                pending_config.value[0]=(float)rx.payload[2];
             } else if (pending_config.subcmd==CFG_CMD_SET_MOUNT_RPY && rx.len==14U) {
                 for(int k=0;k<3;k++) pending_config.value[k]=(float)get_i32(&rx.payload[2+4*k])*0.001f*0.0174532925199433f;
             } else if (pending_config.subcmd==CFG_CMD_SET_THERMAL && rx.len==26U) {

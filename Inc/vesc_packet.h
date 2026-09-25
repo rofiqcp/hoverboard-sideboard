@@ -24,6 +24,8 @@
 #define CFG_CMD_RESET_MOUNT     6U
 #define CFG_CMD_SET_NOISE       7U
 #define CFG_CMD_SET_ACCEL_CAL   8U
+#define CFG_CMD_SET_OUTPUT_MAP  9U
+#define CFG_CMD_RESET_ALL       10U
 
 #define AID_CMD_WHEEL_BODY_X    1U
 #define AID_CMD_WORLD_VELOCITY  2U

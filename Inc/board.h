@@ -37,6 +37,9 @@ int board_uart_tx_busy(void);
 int board_uart_tx_wait_idle(uint32_t timeout_us);
 uint32_t board_uart_rx_overflow_count(void);
 
+/* Self-heal USART2 tanpa reset MCU. Dipanggil periodik dari main/startup. */
+void board_uart_service(void);
+
 /* Independent watchdog aplikasi. Kick hanya dari jalur main yang sehat. */
 void board_watchdog_kick(void);
 

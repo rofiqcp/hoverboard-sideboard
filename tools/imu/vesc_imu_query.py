@@ -3,7 +3,7 @@
 import argparse, math, struct, time
 import serial
 from read_imu import crc16, read_frame
-from serial_common import find_sideboard_port, open_sideboard_port
+from serial_common import open_sideboard_port
 
 PORT='auto'
 
@@ -13,8 +13,8 @@ def packet(p):
 def fauto(b): return struct.unpack('>f',b)[0]
 
 def query_once(requested, baud, per_try_timeout=0.45):
-    mask=0xFFFF; req=bytes((65,mask>>8,mask&255)); port=find_sideboard_port(requested)
-    with open_sideboard_port(port,baud,timeout=.03,attempts=8,delay=.10) as s:
+    mask=0xFFFF; req=bytes((65,mask>>8,mask&255))
+    with open_sideboard_port(requested,baud,timeout=.03,attempts=3,delay=.10) as s:
         # PL2303/CH340 dapat butuh jeda sangat singkat sesudah open. Jangan toggle DTR/RTS.
         time.sleep(.025); s.reset_input_buffer()
         for _ in range(2):
@@ -34,17 +34,20 @@ def query_once(requested, baud, per_try_timeout=0.45):
     return None
 
 def main():
-    ap=argparse.ArgumentParser(); ap.add_argument('--port',default=PORT); ap.add_argument('--baud',type=int,default=921600); ap.add_argument('--attempts',type=int,default=4); a=ap.parse_args()
-    last=None
-    for attempt in range(max(1,a.attempts)):
+    ap=argparse.ArgumentParser(); ap.add_argument('--port',default=PORT); ap.add_argument('--baud',type=int,default=921600); ap.add_argument('--attempts',type=int,default=60); ap.add_argument('--overall-timeout',type=float,default=15.0); a=ap.parse_args()
+    last=None; deadline=time.monotonic()+max(a.overall_timeout,1.0); attempt=0
+    while attempt<max(1,a.attempts) and time.monotonic()<deadline:
+        attempt+=1
         try: last=query_once(a.port,a.baud)
         except (serial.SerialException,OSError,FileNotFoundError): last=None
         if last: break
-        if attempt+1<a.attempts: time.sleep(.10)
-    if not last: raise SystemExit('Tidak ada response VESC IMU setelah retry')
+        time.sleep(.10)
+    if not last: raise SystemExit(f'Tidak ada response VESC IMU setelah {attempt} sesi retry')
     m,vals=last
     print('COMM_GET_IMU_DATA OK mask=0x%04X'%m)
     print('RPY rad=',vals[0:3],'deg=',[v*180/math.pi for v in vals[0:3]])
     print('ACC g=',vals[3:6],'GYRO dps=',vals[6:9],'MAG=',vals[9:12],'Q=',vals[12:16])
 
-if __name__=='__main__': main()
+if __name__=="__main__":
+    from run_csv import run_logged
+    raise SystemExit(run_logged(main,__file__))

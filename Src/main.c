@@ -103,6 +103,7 @@ static int aid_recent(uint32_t now_us,uint32_t last_us)
 static void service_bootloader_while_starting(void)
 {
     board_watchdog_kick();
+    board_uart_service();
     VescImuState empty_state;
     memset(&empty_state, 0, sizeof(empty_state));
 
@@ -310,6 +311,44 @@ static float zero_rate_sigma_from_settings(const PersistedSettings *settings)
     return sigma;
 }
 
+static void output_map_vec3(float v[3], uint16_t map)
+{
+    if(map & OUTPUT_MAP_SWAP_RP){float t=v[0];v[0]=v[1];v[1]=t;}
+    if(map & OUTPUT_MAP_INVERT_X)v[0]=-v[0];
+    if(map & OUTPUT_MAP_INVERT_Y)v[1]=-v[1];
+    if(map & OUTPUT_MAP_INVERT_Z)v[2]=-v[2];
+}
+
+static void output_map_raw3(int16_t v[3], uint16_t map)
+{
+    if(map & OUTPUT_MAP_SWAP_RP){int16_t t=v[0];v[0]=v[1];v[1]=t;}
+    if(map & OUTPUT_MAP_INVERT_X)v[0]=(v[0]==INT16_MIN)?INT16_MAX:(int16_t)-v[0];
+    if(map & OUTPUT_MAP_INVERT_Y)v[1]=(v[1]==INT16_MIN)?INT16_MAX:(int16_t)-v[1];
+    if(map & OUTPUT_MAP_INVERT_Z)v[2]=(v[2]==INT16_MIN)?INT16_MAX:(int16_t)-v[2];
+}
+
+static void apply_output_mapping(VescImuState *out,const PersistedSettings *settings)
+{
+    uint16_t map=(uint16_t)(settings->reserved & OUTPUT_MAP_MASK);
+    if(!map)return;
+    output_map_raw3(out->raw.accel_raw,map);
+    output_map_raw3(out->raw.gyro_raw,map);
+    output_map_vec3(out->accel_cal,map);
+    output_map_vec3(out->gyro_cal,map);
+    output_map_vec3(out->linear_accel_world,map);
+    output_map_vec3(out->velocity,map);
+    output_map_vec3(out->position,map);
+    if(map & OUTPUT_MAP_SWAP_RP){
+        float t=out->roll_rad;out->roll_rad=out->pitch_rad;out->pitch_rad=t;
+        t=out->attitude_std_rad[0];out->attitude_std_rad[0]=out->attitude_std_rad[1];out->attitude_std_rad[1]=t;
+        t=out->velocity_std_mps[0];out->velocity_std_mps[0]=out->velocity_std_mps[1];out->velocity_std_mps[1]=t;
+        t=out->position_std_m[0];out->position_std_m[0]=out->position_std_m[1];out->position_std_m[1]=t;
+    }
+    if(map & OUTPUT_MAP_INVERT_X)out->roll_rad=-out->roll_rad;
+    if(map & OUTPUT_MAP_INVERT_Y)out->pitch_rad=-out->pitch_rad;
+    if(map & OUTPUT_MAP_INVERT_Z)out->yaw_rad=-out->yaw_rad;
+}
+
 static void fill_telemetry(VescImuState *out,
                            const ImuSample *raw,
                            const float accel[3],
@@ -398,6 +437,7 @@ static void fill_telemetry(VescImuState *out,
     out->temperature_c=raw->temperature_c;
     out->imu_whoami=di?di->whoami:0U; out->imu_class=di?(uint8_t)di->device_class:0U;
     out->observed_sample_hz=fs?fs->observed_sample_hz:0.0f;
+    apply_output_mapping(out,settings);
 }
 
 int main(void)
@@ -505,7 +545,11 @@ int main(void)
     /* ZUPT otomatis hanya diizinkan dari keadaan boot diam sampai gerak pertama.
      * Sesudah AGV mulai bergerak, ZUPT hanya dilakukan atas perintah master. */
     uint8_t startup_zupt = startup.stationary ? 1U : 0U;
+    /* Auto re-arm hanya berlaku untuk standalone/startup. Begitu master secara
+     * eksplisit menyatakan MOVING, IMU tidak boleh mengalahkan informasi itu. */
+    uint8_t auto_zupt_rearm_enabled = startup.stationary ? 1U : 0U;
     uint8_t master_stationary = 0U;
+    uint8_t auto_rearm_still_count = 0U;
     uint8_t zupt_divider = 0U;
     uint8_t zupt_phase = 0U;
     uint8_t gravity_divider = 1U;
@@ -526,6 +570,7 @@ int main(void)
 
     for (;;) {
         board_watchdog_kick();
+        board_uart_service();
         /* TIM2 menentukan cadence service. Jika CPU pernah terlambat, pending>1
          * hanya menjadi diagnostik; FIFO tetap membawa semua sampel sensor. */
         uint32_t pending_ticks = board_wait_imu_tick();
@@ -601,8 +646,13 @@ int main(void)
             aid_status.reject_count++;
             continue;
         }
-        /* Gravity correction 50 Hz. Saat bergerak gate dibuat jauh lebih ketat
-         * dan measurement-noise diperbesar agar percepatan AGV tidak dianggap tilt. */
+        /*
+         * Gravity correction 50 Hz. Saat bergerak tetap memakai gate magnitude
+         * + direction yang jauh lebih ketat dan measurement-noise lebih besar.
+         * Pure gyro propagation diuji terhadap tes2 dan justru memperbesar drift,
+         * jadi moving correction dipertahankan tetapi tidak pernah dianggap
+         * sebagai observasi posisi.
+         */
         if (++gravity_divider >= 2U) {
             gravity_divider = 0U;
             gravity_ok = (uint8_t)eskf_nav_correct_gravity(&eskf, accel_for_gravity, sample_is_still);
@@ -610,8 +660,31 @@ int main(void)
 
         zupt_applied = 0U;
         if (startup_zupt && !sample_is_still) {
-            /* Gerak pertama mematikan ZUPT otomatis agar gerak konstan tidak dianggap diam. */
+            /* Gerak terdeteksi: lepaskan static hold. */
             startup_zupt = 0U;
+            auto_rearm_still_count = 0U;
+        } else if (!startup_zupt && auto_zupt_rearm_enabled &&
+                   sample_is_still && !master_stationary) {
+            /*
+             * Estimator velocity tidak boleh dipakai untuk menentukan rest:
+             * justru velocity-lah state yang drift saat dead-reckoning. Setelah
+             * evidence IMU diam kontinu ~0.8 s (di luar hysteresis detector),
+             * zero velocity menjadi measurement yang valid dan boleh mereset
+             * state velocity secara eksplisit. STATIONARY_OFF men-disable path
+             * ini untuk AGV yang sedang diperintah bergerak konstan.
+             */
+            if (auto_rearm_still_count < AUTO_ZUPT_REARM_STILL_SAMPLES)
+                auto_rearm_still_count++;
+            if (auto_rearm_still_count >= AUTO_ZUPT_REARM_STILL_SAMPLES) {
+                const float zero_velocity[3]={0.0f,0.0f,0.0f};
+                (void)eskf_nav_reset_world_velocity(&eskf, zero_velocity, ZUPT_SIGMA_MPS);
+                (void)eskf_nav_fuse_zero_rate(&eskf, gyro, zero_rate_sigma);
+                startup_zupt = 1U;
+                auto_rearm_still_count = 0U;
+                zupt_applied = 1U;
+            }
+        } else if (!sample_is_still) {
+            auto_rearm_still_count = 0U;
         }
 
         int allow_zupt = sample_is_still &&
@@ -652,6 +725,7 @@ int main(void)
                 (void)imu_mpu6xxx_fifo_reset();
                 last_fifo_resync = imu_mpu6xxx_get_fifo_stats()->fifo_resync_count;
                 startup_zupt = 1U;
+                auto_zupt_rearm_enabled = 1U;
             } else {
                 /* RAM calibration candidate belum boleh aktif bila persistence gagal.
                  * Reload record committed terakhir dan laporkan kegagalan eksplisit. */
@@ -703,6 +777,7 @@ int main(void)
                     (void)imu_mpu6xxx_fifo_reset();
                     last_fifo_resync = imu_mpu6xxx_get_fifo_stats()->fifo_resync_count;
                     startup_zupt = 1U;
+                    auto_zupt_rearm_enabled = 1U;
                 } else {
                     PersistedSettings rollback; int ls=eeprom_settings_load(&rollback);
                     if(ls){settings=rollback;eeprom_valid=1;}else{eeprom_settings_defaults(&settings);eeprom_valid=0;}
@@ -719,6 +794,8 @@ int main(void)
         } else if (action == VESC_ACTION_ZERO_NAV) {
             eskf_nav_reset_motion(&eskf);
             startup_zupt = 1U;
+            auto_zupt_rearm_enabled = 1U;
+            auto_rearm_still_count = 0U;
             (void)vesc_send_calibration_status(&huart2, CAL_CMD_ZERO_NAV, 0U, &telemetry);
         } else if (action == VESC_ACTION_ZUPT) {
             if (sample_is_still) {
@@ -731,17 +808,22 @@ int main(void)
             }
         } else if (action == VESC_ACTION_STATIONARY_ON) {
             master_stationary = 1U;
+            startup_zupt = 1U;
+            auto_zupt_rearm_enabled = 1U;
+            auto_rearm_still_count = 0U;
             (void)vesc_send_calibration_status(&huart2, CAL_CMD_STATIONARY_ON, 0U, &telemetry);
         } else if (action == VESC_ACTION_STATIONARY_OFF) {
             /* Master mengetahui kendaraan akan bergerak; jangan menunggu IMU
              * membuktikan motion karena gerak konstan tidak observable oleh IMU. */
             master_stationary = 0U;
             startup_zupt = 0U;
+            auto_zupt_rearm_enabled = 0U;
+            auto_rearm_still_count = 0U;
             (void)vesc_send_calibration_status(&huart2, CAL_CMD_STATIONARY_OFF, 0U, &telemetry);
         } else if (action == VESC_ACTION_CONFIG) {
             VescConfigRequest req;
             if(vesc_take_config_request(&req)){
-                int changed=0,reinit=0;
+                int changed=0,reinit=0,reset_all=0;
                 if(req.subcmd!=CFG_CMD_GET && !sample_is_still){
                     (void)vesc_send_config_status(&huart2,req.subcmd,3U,&settings);
                     continue;
@@ -780,6 +862,15 @@ int main(void)
                         memcpy(settings.accel_transform,&req.value[3],9U*sizeof(float));
                         settings.calibration_flags|=CAL_FLAG_ROTATE_VALID;changed=1;reinit=1;}
                     else {(void)vesc_send_config_status(&huart2,req.subcmd,2U,&settings);continue;}
+                }else if(req.subcmd==CFG_CMD_SET_OUTPUT_MAP){
+                    uint16_t map=(uint16_t)((uint32_t)req.value[0]);
+                    if((map & ~OUTPUT_MAP_MASK)==0U){
+                        settings.reserved=(uint16_t)((settings.reserved & ~OUTPUT_MAP_MASK)|map);
+                        changed=1;
+                    }else{(void)vesc_send_config_status(&huart2,req.subcmd,2U,&settings);continue;}
+                }else if(req.subcmd==CFG_CMD_RESET_ALL){
+                    eeprom_settings_defaults(&settings);
+                    changed=1;reinit=1;reset_all=1;
                 }
                 uint8_t status=0U;
                 if(changed){eeprom_valid=eeprom_settings_save(&settings);if(!eeprom_valid)status=1U;}
@@ -789,6 +880,7 @@ int main(void)
                     eskf.accel_dir_noise=settings.accel_dir_noise;
                 }
                 if(reinit && status==0U){
+                    if(reset_all){imu_calibration_init(&calibration);filter_health_reset_count=0U;}
                     imu_apply_static_calibration(&raw,&settings,accel,gyro); init_filter(&eskf,&raw,&settings);
                     memset(&aid_status,0,sizeof(aid_status));
                     memset(aid_req_valid,0,sizeof(aid_req_valid));
@@ -832,7 +924,12 @@ int main(void)
                             if(!aid_recent(now_us,aid_status.last_wheel_us))
                                 eskf_nav_inflate_velocity_uncertainty(&eskf,1.0f);
                             ok=eskf_nav_fuse_body_velocity(&eskf,target,0x01U,sigma);
-                            if(ok){aid_status.last_wheel_us=now_us;aid_status.last_any_us=now_us;}
+                            if(ok){
+                                aid_status.last_wheel_us=now_us;aid_status.last_any_us=now_us;
+                                if (fabsf(req.value[0]) > MOTION_AID_RELEASE_SPEED_MPS) {
+                                    startup_zupt=0U; auto_rearm_still_count=0U;
+                                }
+                            }
                             if(ok && (req.flags&AID_FLAG_NHC)){
                                 float nhc_sigma=NHC_SIGMA_MPS*(1.0f+(float)age/(float)AID_MAX_AGE_US);
                                 if(eskf_nav_fuse_body_velocity(&eskf,target,0x06U,nhc_sigma))aid_status.last_nhc_us=now_us;
@@ -842,7 +939,13 @@ int main(void)
                         if(!aid_recent(now_us,aid_status.last_vel_us))
                             ok=eskf_nav_reset_world_velocity(&eskf,req.value,sigma);
                         else ok=eskf_nav_fuse_world_velocity(&eskf,req.value,sigma);
-                        if(ok){aid_status.last_vel_us=now_us;aid_status.last_any_us=now_us;}
+                        if(ok){
+                            aid_status.last_vel_us=now_us;aid_status.last_any_us=now_us;
+                            float v2=req.value[0]*req.value[0]+req.value[1]*req.value[1]+req.value[2]*req.value[2];
+                            if(v2 > MOTION_AID_RELEASE_SPEED_MPS*MOTION_AID_RELEASE_SPEED_MPS){
+                                startup_zupt=0U; auto_rearm_still_count=0U;
+                            }
+                        }
                     }else if(req.type==AID_CMD_WORLD_POSITION){
                         if(!aid_recent(now_us,aid_status.last_pos_us))
                             ok=eskf_nav_reset_world_position(&eskf,req.value,sigma);
