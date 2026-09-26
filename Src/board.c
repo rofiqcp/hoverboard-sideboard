@@ -13,7 +13,7 @@ UART_HandleTypeDef huart2;
 static volatile uint8_t uart_rx_ring[UART_RX_RING_SIZE];
 static volatile uint8_t uart_rx_head = 0U;
 static volatile uint8_t uart_rx_tail = 0U;
-static volatile uint32_t uart_rx_overflow_counter = 0U;
+static volatile BoardRuntimeStats runtime_stats;
 
 #define UART_TX_BUFFER_SIZE 128U
 static uint8_t uart_tx_buffer[UART_TX_BUFFER_SIZE];
@@ -25,7 +25,6 @@ static volatile uint32_t uart_tx_started_us = 0U;
 /* TIM2 dipakai sebagai scheduler IMU 100 Hz. Counter pending membuat tick yang
  * datang ketika CPU masih bekerja tetap terlihat, tanpa menjalankan ESKF di ISR. */
 static volatile uint32_t imu_tick_pending = 0U;
-static volatile uint32_t imu_tick_total = 0U;
 
 static void clock_init(void)
 {
@@ -127,7 +126,9 @@ static void imu_scheduler_init(void)
     TIM2->SR = 0U;
     TIM2->DIER = TIM_DIER_UIE;
     imu_tick_pending = 0U;
-    imu_tick_total = 0U;
+    runtime_stats.imu_tick_total = 0U;
+    runtime_stats.imu_deadline_miss_count = 0U;
+    runtime_stats.imu_max_pending_ticks = 0U;
     HAL_NVIC_SetPriority(TIM2_IRQn, 2U, 0U);
     HAL_NVIC_EnableIRQ(TIM2_IRQn);
     TIM2->CR1 = TIM_CR1_CEN;
@@ -260,6 +261,7 @@ uint32_t board_wait_imu_tick(void)
     __disable_irq();
     uint32_t pending = imu_tick_pending;
     imu_tick_pending = 0U;
+    board_runtime_account_imu_pending(&runtime_stats, pending);
     if (!primask) __enable_irq();
     return pending;
 }
@@ -269,7 +271,7 @@ void TIM2_IRQHandler(void)
     if (TIM2->SR & TIM_SR_UIF) {
         TIM2->SR &= ~TIM_SR_UIF;
         if (imu_tick_pending < 0xFFFFFFFFUL) imu_tick_pending++;
-        imu_tick_total++;
+        runtime_stats.imu_tick_total++;
     }
 }
 
@@ -285,6 +287,7 @@ int board_uart_rx_pop(uint8_t *out)
 
 static void uart_cancel_async_tx(void)
 {
+    runtime_stats.uart_tx_timeout_count++;
     uint32_t primask = __get_PRIMASK();
     __disable_irq();
     CLEAR_BIT(USART2->CR1, USART_CR1_TXEIE);
@@ -332,7 +335,20 @@ int board_uart_tx_wait_idle(uint32_t timeout_us)
 
 uint32_t board_uart_rx_overflow_count(void)
 {
-    return uart_rx_overflow_counter;
+    return runtime_stats.uart_rx_overflow_count;
+}
+
+void board_get_runtime_stats(BoardRuntimeStats *out)
+{
+    if (!out) return;
+    uint32_t primask = __get_PRIMASK();
+    __disable_irq();
+    out->imu_tick_total = runtime_stats.imu_tick_total;
+    out->imu_deadline_miss_count = runtime_stats.imu_deadline_miss_count;
+    out->imu_max_pending_ticks = runtime_stats.imu_max_pending_ticks;
+    out->uart_rx_overflow_count = runtime_stats.uart_rx_overflow_count;
+    out->uart_tx_timeout_count = runtime_stats.uart_tx_timeout_count;
+    if (!primask) __enable_irq();
 }
 
 void board_uart_service(void)
@@ -367,7 +383,7 @@ void USART2_IRQHandler(void)
             /* Drop byte tertua, pertahankan traffic terbaru. Parser melihat counter
              * berubah dan akan reset frame parsial sebelum memproses data baru. */
             uart_rx_tail = (uint8_t)((uart_rx_tail + 1U) % UART_RX_RING_SIZE);
-            uart_rx_overflow_counter++;
+            runtime_stats.uart_rx_overflow_count++;
         }
         uart_rx_ring[head] = b;
         uart_rx_head = next;

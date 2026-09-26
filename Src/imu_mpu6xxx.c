@@ -25,22 +25,33 @@
 #define USER_FIFO_RESET      0x04U
 #define INT_FIFO_OVERFLOW    0x10U
 #define FIFO_CAPACITY_BYTES  512U
+#define IMU_CONFIG_VERIFY_INTERVAL_US 1500000UL
+#define IMU_CLIP_THRESHOLD_RAW 32112
 
 static ImuDeviceInfo info;
 static ImuFifoStats fifo_stats;
+static ImuRuntimeHealth runtime_health;
 static uint32_t sample_index;
 static int16_t temperature_raw_cache;
 static uint8_t temperature_read_divider;
 static int write_reg(uint8_t reg, uint8_t value)
 {
-    return HAL_I2C_Mem_Write(&hi2c1, MPU6XXX_I2C_ADDR, reg,
-                             I2C_MEMADD_SIZE_8BIT, &value, 1U, 20U) == HAL_OK;
+    if (HAL_I2C_Mem_Write(&hi2c1, MPU6XXX_I2C_ADDR, reg,
+                          I2C_MEMADD_SIZE_8BIT, &value, 1U, 20U) == HAL_OK) {
+        return 1;
+    }
+    runtime_health.i2c_error_count++;
+    return 0;
 }
 
 static int read_bytes(uint8_t reg, uint8_t *data, uint16_t len)
 {
-    return HAL_I2C_Mem_Read(&hi2c1, MPU6XXX_I2C_ADDR, reg,
-                            I2C_MEMADD_SIZE_8BIT, data, len, 20U) == HAL_OK;
+    if (HAL_I2C_Mem_Read(&hi2c1, MPU6XXX_I2C_ADDR, reg,
+                         I2C_MEMADD_SIZE_8BIT, data, len, 20U) == HAL_OK) {
+        return 1;
+    }
+    runtime_health.i2c_error_count++;
+    return 0;
 }
 
 static int read_reg(uint8_t reg, uint8_t *value)
@@ -61,6 +72,7 @@ uint8_t imu_mpu6xxx_whoami(void)
 
 const ImuDeviceInfo *imu_mpu6xxx_get_info(void) { return &info; }
 const ImuFifoStats *imu_mpu6xxx_get_fifo_stats(void) { return &fifo_stats; }
+const ImuRuntimeHealth *imu_mpu6xxx_get_runtime_health(void) { return &runtime_health; }
 static int configure_descriptor(uint8_t who)
 {
     memset(&info, 0, sizeof(info));
@@ -119,20 +131,86 @@ int imu_mpu6xxx_fifo_reset(void)
     return 1;
 }
 
-static int verify_base_config(uint8_t divider)
+static int verify_config_once(uint8_t expected_who, uint8_t divider)
 {
     uint8_t v = 0U;
-    if (!read_reg(REG_SMPLRT_DIV, &v) || v != divider) return 0;
-    if (!read_reg(REG_CONFIG, &v) || (v & 0x07U) != 0x03U) return 0;
-    if (!read_reg(REG_GYRO_CONFIG, &v) || (v & 0x18U) != 0x08U) return 0;
-    if (!read_reg(REG_ACCEL_CONFIG, &v) || (v & 0x18U) != 0x08U) return 0;
-    if (!read_reg(REG_FIFO_EN, &v) || (v & FIFO_ENABLE_AG) != FIFO_ENABLE_AG) return 0;
-    if (!read_reg(REG_USER_CTRL, &v) || (v & USER_FIFO_ENABLE) == 0U) return 0;
+
+    if (!read_reg(REG_WHO_AM_I, &v)) return -1;
+    if (v != expected_who) return 0;
+    if (!read_reg(REG_SMPLRT_DIV, &v)) return -1;
+    if (v != divider) return 0;
+    if (!read_reg(REG_CONFIG, &v)) return -1;
+    if ((v & 0x07U) != 0x03U) return 0;
+    if (!read_reg(REG_GYRO_CONFIG, &v)) return -1;
+    if ((v & 0x18U) != 0x08U) return 0;
+    if (!read_reg(REG_ACCEL_CONFIG, &v)) return -1;
+    if ((v & 0x18U) != 0x08U) return 0;
+    if (!read_reg(REG_FIFO_EN, &v)) return -1;
+    if ((v & FIFO_ENABLE_AG) != FIFO_ENABLE_AG) return 0;
+    if (!read_reg(REG_USER_CTRL, &v)) return -1;
+    if ((v & USER_FIFO_ENABLE) == 0U) return 0;
+    if (info.accel_config2_supported) {
+        if (!read_reg(REG_ACCEL_CONFIG2, &v)) return -1;
+        if ((v & 0x07U) != 0x03U) return 0;
+    }
     return 1;
+}
+
+static int record_config_verification(uint32_t now_us, uint8_t expected_who, uint8_t divider)
+{
+    int result = verify_config_once(expected_who, divider);
+    runtime_health.last_config_check_us = now_us;
+    if (result > 0) {
+        runtime_health.config_ok = 1U;
+        return 1;
+    }
+    runtime_health.config_ok = 0U;
+    if (result == 0) runtime_health.config_mismatch_count++;
+    return 0;
+}
+
+int imu_mpu6xxx_periodic_verify(uint32_t now_us)
+{
+    if (info.device_class == IMU_CLASS_UNKNOWN || info.whoami == 0U) {
+        runtime_health.config_ok = 0U;
+        return 0;
+    }
+    if (runtime_health.last_config_check_us != 0U &&
+        (uint32_t)(now_us - runtime_health.last_config_check_us) < IMU_CONFIG_VERIFY_INTERVAL_US) {
+        return runtime_health.config_ok != 0U;
+    }
+
+    const uint8_t divider = (uint8_t)(1000U / MPU6XXX_SAMPLE_HZ - 1U);
+    return record_config_verification(now_us, info.whoami, divider);
+}
+
+static int raw_is_clipped(int16_t raw)
+{
+    return raw >= IMU_CLIP_THRESHOLD_RAW || raw <= -IMU_CLIP_THRESHOLD_RAW;
+}
+
+static void note_fifo_clipping(const ImuSample *sample)
+{
+    for (uint8_t axis = 0U; axis < 3U; axis++) {
+        if (raw_is_clipped(sample->accel_raw[axis])) {
+            runtime_health.accel_clip_count[axis]++;
+            runtime_health.last_accel_clip_mask |= (uint8_t)(1U << axis);
+        }
+        if (raw_is_clipped(sample->gyro_raw[axis])) {
+            runtime_health.gyro_clip_count[axis]++;
+            runtime_health.last_gyro_clip_mask |= (uint8_t)(1U << axis);
+        }
+    }
 }
 
 int imu_mpu6xxx_init(void)
 {
+    runtime_health.init_count++;
+    if (runtime_health.init_count > 1U) runtime_health.reinit_count++;
+    runtime_health.config_ok = 0U;
+    runtime_health.last_accel_clip_mask = 0U;
+    runtime_health.last_gyro_clip_mask = 0U;
+
     uint8_t who = imu_mpu6xxx_whoami();
     if (!configure_descriptor(who)) return 0;
     memset(&fifo_stats, 0, sizeof(fifo_stats));
@@ -168,7 +246,7 @@ int imu_mpu6xxx_init(void)
 
     if (!imu_mpu6xxx_fifo_reset()) return 0;
     HAL_Delay(20U);
-    return verify_base_config(divider) && imu_mpu6xxx_whoami() == who;
+    return record_config_verification(board_micros(), who, divider);
 }
 
 int imu_mpu6xxx_read(ImuSample *sample)
@@ -196,6 +274,8 @@ int imu_mpu6xxx_read_fifo(ImuSample *samples, uint8_t max_samples, uint8_t *out_
     uint8_t fifo_b[12U * 8U];
     if (!samples || !out_count || max_samples == 0U || max_samples > 8U) return 0;
     *out_count = 0U;
+    runtime_health.last_accel_clip_mask = 0U;
+    runtime_health.last_gyro_clip_mask = 0U;
 
     if (!read_bytes(REG_FIFO_COUNT_H, count_b, 2U)) return 0;
     uint16_t fifo_bytes = ((uint16_t)count_b[0] << 8) | count_b[1];
@@ -246,6 +326,9 @@ int imu_mpu6xxx_read_fifo(ImuSample *samples, uint8_t max_samples, uint8_t *out_
     int16_t temp_raw = temperature_raw_cache;
 
     uint32_t now_us = board_micros();
+    /* Poll murah setiap batch; transaksi register sendiri di-rate-limit 1,5 s.
+     * Hasil audit hanya masuk health API, tidak mengubah alur sampel/recovery. */
+    (void)imu_mpu6xxx_periodic_verify(now_us);
 
     /* Sensor FIFO punya oscillator sendiri. Ukur rate aktual seperti pola
      * backend FIFO ArduPilot. Batch pertama hanya membuka window agar tidak
@@ -288,6 +371,7 @@ int imu_mpu6xxx_read_fifo(ImuSample *samples, uint8_t max_samples, uint8_t *out_
         s->sample_time_us = now_us - (uint32_t)(packet_count - 1U - n) * sample_period_us;
         s->sample_index = sample_index++;
         convert_sample(s);
+        note_fifo_clipping(s);
     }
 
     fifo_stats.fifo_sample_count += packet_count;

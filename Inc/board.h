@@ -11,6 +11,29 @@
 extern I2C_HandleTypeDef hi2c1;
 extern UART_HandleTypeDef huart2;
 
+typedef struct {
+    uint32_t imu_tick_total;
+    uint32_t imu_deadline_miss_count;
+    uint32_t imu_max_pending_ticks;
+    uint32_t uart_rx_overflow_count;
+    uint32_t uart_tx_timeout_count;
+} BoardRuntimeStats;
+
+/* Helper accounting integer-only; dipakai board_wait_imu_tick() dan host test. */
+static inline void board_runtime_account_imu_pending(volatile BoardRuntimeStats *stats,
+                                                     uint32_t pending)
+{
+    if (!stats) return;
+    if (pending > stats->imu_max_pending_ticks) stats->imu_max_pending_ticks = pending;
+    if (pending > 1U) {
+        uint32_t missed = pending - 1U;
+        if (stats->imu_deadline_miss_count > UINT32_MAX - missed)
+            stats->imu_deadline_miss_count = UINT32_MAX;
+        else
+            stats->imu_deadline_miss_count += missed;
+    }
+}
+
 void board_init(void);
 uint32_t board_micros(void);
 
@@ -36,6 +59,7 @@ int board_uart_tx_async(const uint8_t *data, uint16_t len);
 int board_uart_tx_busy(void);
 int board_uart_tx_wait_idle(uint32_t timeout_us);
 uint32_t board_uart_rx_overflow_count(void);
+void board_get_runtime_stats(BoardRuntimeStats *out);
 
 /* Self-heal USART2 tanpa reset MCU. Dipanggil periodik dari main/startup. */
 void board_uart_service(void);

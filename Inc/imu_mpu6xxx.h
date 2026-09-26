@@ -42,6 +42,19 @@ typedef struct {
     float observed_sample_hz;
 } ImuFifoStats;
 
+typedef struct {
+    uint32_t i2c_error_count;
+    uint32_t init_count;
+    uint32_t reinit_count;
+    uint32_t config_mismatch_count;
+    uint32_t accel_clip_count[3];
+    uint32_t gyro_clip_count[3];
+    uint8_t last_accel_clip_mask;
+    uint8_t last_gyro_clip_mask;
+    uint8_t config_ok;
+    uint32_t last_config_check_us;
+} ImuRuntimeHealth;
+
 int imu_mpu6xxx_init(void);
 int imu_mpu6xxx_read(ImuSample *sample);
 int imu_mpu6xxx_read_fifo(ImuSample *samples, uint8_t max_samples, uint8_t *out_count);
@@ -49,5 +62,7 @@ int imu_mpu6xxx_fifo_reset(void);
 uint8_t imu_mpu6xxx_whoami(void);
 const ImuDeviceInfo *imu_mpu6xxx_get_info(void);
 const ImuFifoStats *imu_mpu6xxx_get_fifo_stats(void);
+const ImuRuntimeHealth *imu_mpu6xxx_get_runtime_health(void);
+int imu_mpu6xxx_periodic_verify(uint32_t now_us);
 
 #endif
