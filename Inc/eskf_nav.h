@@ -5,6 +5,41 @@
 
 #define ESKF_NAV_DIM 15
 
+typedef enum {
+    ESKF_DIAG_REASON_NONE = 0,
+    ESKF_DIAG_REASON_INVALID_INPUT,
+    ESKF_DIAG_REASON_INNOVATION_LIMIT,
+    ESKF_DIAG_REASON_NIS_GATE,
+    ESKF_DIAG_REASON_NUMERICAL
+} EskfNavDiagReason;
+
+typedef struct {
+    float last_wheel_innovation_mps;
+    float last_wheel_nis;
+    float last_yaw_innovation_rad;
+    float last_yaw_nis;
+    float last_velocity_innovation_norm_mps;
+    float last_velocity_nis_max;
+    float last_position_innovation_norm_m;
+    float last_position_nis_max;
+
+    uint32_t wheel_accept_count;
+    uint32_t wheel_reject_count;
+    uint32_t yaw_accept_count;
+    uint32_t yaw_reject_count;
+    uint32_t velocity_accept_count;
+    uint32_t velocity_reject_count;
+    uint32_t position_accept_count;
+    uint32_t position_reject_count;
+    uint32_t covariance_repair_count;
+
+    uint8_t covariance_psd_ok;
+    uint8_t last_wheel_reason;
+    uint8_t last_yaw_reason;
+    uint8_t last_velocity_reason;
+    uint8_t last_position_reason;
+} EskfNavDiagnostics;
+
 typedef struct {
     float q[4];                 /* Quaternion body -> world: w,x,y,z. */
     float velocity[3];          /* Kecepatan lokal world frame, m/s. */
@@ -24,6 +59,7 @@ typedef struct {
     uint32_t gravity_reject_count;
     uint32_t zupt_count;
     uint32_t zero_rate_count;
+    EskfNavDiagnostics diagnostics;
     uint8_t initialized;
 } EskfNav;
 
@@ -55,5 +91,14 @@ void eskf_nav_get_euler_rad(const EskfNav *f, float *roll, float *pitch, float *
 void eskf_nav_get_euler_deg(const EskfNav *f, float *roll, float *pitch, float *yaw);
 void eskf_nav_rotation_matrix(const EskfNav *f, float R[3][3]);
 void eskf_nav_linear_accel_world(const EskfNav *f, const float accel_mps2[3], float out[3]);
+
+/* Diagnostics do not alter filter state. covariance_psd_ok is evaluated on demand. */
+void eskf_nav_get_diagnostics(const EskfNav *f, EskfNavDiagnostics *out);
+
+/* Returns world velocity expressed in body axes: +X forward, +Y left, +Z up. */
+int eskf_nav_get_body_velocity(const EskfNav *f, float velocity_body[3]);
+
+/* Low-rate full covariance check. Tolerates only float roundoff; never repairs P. */
+int eskf_nav_covariance_psd_check(const EskfNav *f);
 
 #endif
