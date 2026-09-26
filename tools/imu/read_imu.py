@@ -17,6 +17,7 @@ from flash_uart import catch_bootloader,parse_info,transact,CMD_GO
 PORT_DEFAULT = "auto"
 BAUD_DEFAULT = 921600
 COMM_SIDEBOARD_IMU = 0xF0
+COMM_SIDEBOARD_DIAG = 0xF5
 
 
 def crc16(data: bytes) -> int:
@@ -130,6 +131,56 @@ def decode_imu(payload: bytes):
         data["temp_c"]=temp_md/1000.0; data["imu_whoami"]=who; data["imu_class"]=klass; data["observed_sample_hz"]=rate_mhz/1000.0
     return data
 
+def decode_diag(payload: bytes):
+    """Decode fixed-point diagnostic packet v1 (0xF5) without changing v5 telemetry."""
+    if not payload or payload[0] != COMM_SIDEBOARD_DIAG or len(payload) != 69:
+        return None
+    f = struct.unpack(">BBhHHHBBBB7IH4IBII", payload)
+    return {
+        "version": f[1],
+        "wheel_innovation_mps": f[2] / 1000.0,
+        "wheel_nis": f[3] / 100.0,
+        "effective_wheel_sigma_mps": f[4] / 1000.0,
+        "slip_score": f[5] / 1000.0,
+        "slip_state": f[6],
+        "accel_clip_mask": f[7],
+        "gyro_clip_mask": f[8],
+        "imu_config_ok": bool(f[9]),
+        "accel_clip_count": f[10],
+        "gyro_clip_count": f[11],
+        "imu_config_mismatch_count": f[12],
+        "i2c_error_count": f[13],
+        "imu_reinit_count": f[14],
+        "fifo_overflow_count": f[15],
+        "fifo_resync_count": f[16],
+        "fifo_max_bytes": f[17],
+        "scheduler_miss_count": f[18],
+        "max_pending_ticks": f[19],
+        "uart_rx_overflow_count": f[20],
+        "uart_tx_timeout_count": f[21],
+        "covariance_psd_ok": bool(f[22]),
+        "aiding_reject_count": f[23],
+        "filter_health_reset_count": f[24],
+    }
+
+
+def format_diag(d: dict) -> str:
+    return (
+        f"DIAG slip={d['slip_state']} score={d['slip_score']:.3f} "
+        f"wheelInnov={d['wheel_innovation_mps']:+.3f}m/s NIS={d['wheel_nis']:.2f} "
+        f"sigmaEff={d['effective_wheel_sigma_mps']:.3f}m/s "
+        f"clipA=0x{d['accel_clip_mask']:02X}/{d['accel_clip_count']} "
+        f"clipG=0x{d['gyro_clip_mask']:02X}/{d['gyro_clip_count']} "
+        f"cfg={'ok' if d['imu_config_ok'] else 'BAD'} mismatch={d['imu_config_mismatch_count']} "
+        f"i2c={d['i2c_error_count']} reinit={d['imu_reinit_count']} "
+        f"fifo={d['fifo_overflow_count']}/{d['fifo_resync_count']} max={d['fifo_max_bytes']} "
+        f"schedMiss={d['scheduler_miss_count']} pendingMax={d['max_pending_ticks']} "
+        f"uartRxOv={d['uart_rx_overflow_count']} uartTxTO={d['uart_tx_timeout_count']} "
+        f"PSD={'ok' if d['covariance_psd_ok'] else 'BAD'} "
+        f"aidReject={d['aiding_reject_count']} healthReset={d['filter_health_reset_count']}"
+    )
+
+
 def flag_text(flags: int) -> str:
     """Terjemahkan bit status firmware ke tulisan ringkas bahasa Indonesia."""
     names = []
@@ -174,11 +225,13 @@ def main():
                         help="Tampilkan tiap N frame; default 5 = sekitar 10 Hz dari stream 50 Hz")
     parser.add_argument("--count", type=int, default=0,
                         help="Berhenti setelah jumlah frame valid ini; 0 berarti terus")
-    parser.add_argument("--mode", choices=("raw","ready","all"), default="all",
+    parser.add_argument("--mode", choices=("raw","ready","all","diag"), default="all",
                         help="raw=sensor mentah, ready=data siap pakai, all=diagnostik lengkap")
     args = parser.parse_args()
 
     valid = crc_errors = other_errors = lost = reconnects = reboots = 0
+    diag_frames = 0
+    last_diag = None
     last_seq = last_time_us = None
     sensor_elapsed_us = seq_advance_total = 0
     started = time.monotonic()
@@ -220,8 +273,20 @@ def main():
                             except TimeoutError:
                                 pass
                     continue
+                diag = decode_diag(payload)
+                if diag is not None:
+                    last_diag = diag
+                    diag_frames += 1
+                    last_rx_host = time.monotonic()
+                    if args.mode == "diag":
+                        valid += 1
+                        if valid == 1 or valid % max(args.every, 1) == 0:
+                            print(format_diag(diag))
+                    continue
                 data = decode_imu(payload)
                 if data is None:
+                    continue
+                if args.mode == "diag":
                     continue
                 last_rx_host=time.monotonic()
 
@@ -280,6 +345,7 @@ def main():
                             f"T={temp_c:.2f}C imu=0x{data['imu_whoami']:02X}/c{data['imu_class']} rate={data['observed_sample_hz']:.2f}Hz "
                             f"flags=0x{data['flags']:04X} [{flag_text(data['flags'])}] "
                             f"nav=0x{data['nav_status']:02X}[{nav_text(data['nav_status'])}] resets={data['health_resets']}"
+                            + (f" | {format_diag(last_diag)}" if last_diag else "")
                         )
             except (serial.SerialException, OSError, FileNotFoundError) as exc:
                 reconnects += 1
@@ -300,7 +366,7 @@ def main():
     stream_hz = seq_advance_total / max(sensor_elapsed_us * 1.0e-6, 1e-6) if sensor_elapsed_us else 0.0
     print(f"Ringkasan: valid={valid}, hilang_seq={lost}, crc_error={crc_errors}, "
           f"error_lain={other_errors}, reconnect={reconnects}, reboot/reset={reboots}, "
-          f"stream={stream_hz:.1f} Hz, laju_host_total={valid/elapsed:.1f} frame/s")
+          f"diag={diag_frames}, stream={stream_hz:.1f} Hz, laju_host_total={valid/elapsed:.1f} frame/s")
     if interrupted:
         raise KeyboardInterrupt
     return 0

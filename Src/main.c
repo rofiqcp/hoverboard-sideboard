@@ -10,6 +10,10 @@
 #include "imu_preintegrator.h"
 #include "imu_calibration.h"
 #include "eskf_nav.h"
+#include "slip_observer.h"
+/* platformio source filter is outside Agent 3 ownership; compile Agent 2 module
+ * exactly once through the APP translation unit rather than duplicating logic. */
+#include "slip_observer.c"
 #include "eeprom_flash.h"
 #include "vesc_packet.h"
 #include <math.h>
@@ -33,6 +37,87 @@ typedef struct {
     uint32_t reject_count;
     uint8_t enu_aligned;
 } ExternalAidStatus;
+
+typedef enum {
+    AID_SOURCE_NO_SOURCE = 0,
+    AID_SOURCE_CANDIDATE,
+    AID_SOURCE_TRACKING
+} AidSourceState;
+
+typedef struct {
+    AidSourceState state;
+    uint8_t count;
+    float anchor[3];
+} PositionAcquisition;
+
+typedef struct {
+    AidSourceState state;
+    uint8_t count;
+    float anchor_yaw;
+} YawAcquisition;
+
+static float wrap_pi(float a)
+{
+    while (a > 3.14159265358979323846f) a -= 6.28318530717958647692f;
+    while (a < -3.14159265358979323846f) a += 6.28318530717958647692f;
+    return a;
+}
+
+static uint32_t aid_source_max_age_us(uint8_t type)
+{
+    switch (type) {
+    case AID_CMD_WHEEL_BODY_X: return AID_WHEEL_MAX_AGE_US;
+    case AID_CMD_WORLD_VELOCITY: return AID_WORLD_VEL_MAX_AGE_US;
+    case AID_CMD_WORLD_POSITION: return AID_WORLD_POS_MAX_AGE_US;
+    case AID_CMD_YAW: return AID_YAW_MAX_AGE_US;
+    default: return 0U;
+    }
+}
+
+static int position_acquisition_offer(PositionAcquisition *a,
+                                      const float value[3], float sigma)
+{
+    if (!a || !value || !isfinite(sigma) || sigma <= 0.0f) return 0;
+    if (a->state == AID_SOURCE_NO_SOURCE) {
+        memcpy(a->anchor, value, sizeof(a->anchor));
+        a->count = 1U;
+        a->state = AID_SOURCE_CANDIDATE;
+        return 0;
+    }
+    float dx=value[0]-a->anchor[0], dy=value[1]-a->anchor[1], dz=value[2]-a->anchor[2];
+    float envelope=fmaxf(AID_REACQUIRE_POS_FLOOR_M,AID_REACQUIRE_POS_SIGMA_MULT*sigma);
+    if (dx*dx+dy*dy+dz*dz > envelope*envelope) {
+        memcpy(a->anchor, value, sizeof(a->anchor));
+        a->count = 1U;
+        a->state = AID_SOURCE_CANDIDATE;
+        return 0;
+    }
+    if (a->count < AID_REACQUIRE_COUNT) a->count++;
+    if (a->count >= AID_REACQUIRE_COUNT) {
+        a->state = AID_SOURCE_TRACKING;
+        return 1;
+    }
+    return 0;
+}
+
+static int yaw_acquisition_offer(YawAcquisition *a, float yaw, float sigma)
+{
+    if (!a || !isfinite(yaw) || !isfinite(sigma) || sigma <= 0.0f) return 0;
+    yaw=wrap_pi(yaw);
+    if (a->state == AID_SOURCE_NO_SOURCE) {
+        a->anchor_yaw=yaw; a->count=1U; a->state=AID_SOURCE_CANDIDATE; return 0;
+    }
+    float envelope=fmaxf(AID_REACQUIRE_YAW_FLOOR_RAD,AID_REACQUIRE_YAW_SIGMA_MULT*sigma);
+    if (fabsf(wrap_pi(yaw-a->anchor_yaw)) > envelope) {
+        a->anchor_yaw=yaw; a->count=1U; a->state=AID_SOURCE_CANDIDATE; return 0;
+    }
+    if (a->count < AID_REACQUIRE_COUNT) a->count++;
+    if (a->count >= AID_REACQUIRE_COUNT) {
+        a->state=AID_SOURCE_TRACKING;
+        return 1;
+    }
+    return 0;
+}
 
 typedef struct {
     float q[4],velocity[3],position[3],gyro_bias[3],accel_bias[3];
@@ -567,6 +652,18 @@ int main(void)
     uint16_t aid_req_age_ms[5]={0U};
     uint8_t aid_req_status[5]={0U};
     uint8_t aid_req_valid[5]={0U};
+    PositionAcquisition pos_acquisition={0};
+    YawAcquisition yaw_acquisition={0};
+    SlipObserver slip_observer;
+    slip_observer_init(&slip_observer);
+    float last_effective_wheel_sigma_mps=0.0f;
+    uint32_t last_wheel_observer_us=0U;
+    uint32_t last_psd_check_us=0U;
+    uint32_t last_imu_config_recovery_us=0U;
+    uint8_t covariance_psd_ok=1U;
+    uint8_t diag_stream_divider=0U;
+    EskfNavDiagnostics cached_eskf_diag;
+    memset(&cached_eskf_diag,0,sizeof(cached_eskf_diag));
 
     for (;;) {
         board_watchdog_kick();
@@ -576,6 +673,23 @@ int main(void)
         uint32_t pending_ticks = board_wait_imu_tick();
         (void)pending_ticks;
         uint32_t now_us = board_micros();
+
+        /* Agent 1 performs the register audit internally at a low cadence. If
+         * configuration is no longer trustworthy, no new IMU measurement is
+         * fused. Recover the sensor/preintegrator only; preserve a healthy
+         * nominal navigation state rather than zeroing position/yaw. */
+        if (!imu_mpu6xxx_periodic_verify(now_us)) {
+            if (last_imu_config_recovery_us==0U ||
+                (uint32_t)(now_us-last_imu_config_recovery_us)>=250000U) {
+                last_imu_config_recovery_us=now_us;
+                board_i2c_recover();
+                if (imu_mpu6xxx_init()) {
+                    imu_preintegrator_init(&preintegrator);
+                    last_fifo_resync=imu_mpu6xxx_get_fifo_stats()->fifo_resync_count;
+                }
+            }
+            continue;
+        }
 
         ImuSample fifo_samples[8];
         uint8_t fifo_count = 0U;
@@ -593,6 +707,7 @@ int main(void)
         imu_error_streak = 0U;
 
         const ImuFifoStats *fifo_stats = imu_mpu6xxx_get_fifo_stats();
+        const ImuRuntimeHealth *imu_health = imu_mpu6xxx_get_runtime_health();
         if (fifo_stats->fifo_resync_count != last_fifo_resync) {
             /* Jangan menghubungkan dua sisi gap/overflow sebagai satu interval IMU. */
             imu_preintegrator_init(&preintegrator);
@@ -641,6 +756,9 @@ int main(void)
         }
 
         int sample_is_still = stillness_update(&stillness, accel_for_gravity, gyro_for_still, &eskf);
+        /* Clipped values remain untouched for observability/diagnostics, but a
+         * clipped acceleration batch cannot be trusted as a gravity/rest cue. */
+        if (imu_health && imu_health->last_accel_clip_mask) sample_is_still=0;
         if(recover_filter_if_unhealthy(&eskf,&raw,&settings,&preintegrator,
                                       &last_fifo_resync,(uint8_t)sample_is_still,&startup_zupt,&nominal_backup)) {
             aid_status.reject_count++;
@@ -655,7 +773,30 @@ int main(void)
          */
         if (++gravity_divider >= 2U) {
             gravity_divider = 0U;
-            gravity_ok = (uint8_t)eskf_nav_correct_gravity(&eskf, accel_for_gravity, sample_is_still);
+            if (!imu_health || imu_health->last_accel_clip_mask==0U)
+                gravity_ok = (uint8_t)eskf_nav_correct_gravity(&eskf, accel_for_gravity, sample_is_still);
+            else
+                gravity_ok = 0U;
+        }
+
+        /* Full 15x15 PSD validation is intentionally low-rate. A failure uses
+         * the existing known-good nominal backup and resets covariance only. */
+        if (last_psd_check_us==0U ||
+            (uint32_t)(now_us-last_psd_check_us)>=ESKF_PSD_CHECK_INTERVAL_US) {
+            last_psd_check_us=now_us;
+            covariance_psd_ok=(uint8_t)(eskf_nav_covariance_psd_check(&eskf)?1U:0U);
+            eskf_nav_get_diagnostics(&eskf,&cached_eskf_diag);
+            covariance_psd_ok=(uint8_t)(covariance_psd_ok && cached_eskf_diag.covariance_psd_ok);
+            if (!covariance_psd_ok) {
+                filter_health_reset_count++;
+                if (!nominal_backup_restore(&eskf,&nominal_backup))
+                    init_filter(&eskf,&raw,&settings);
+                imu_preintegrator_init(&preintegrator);
+                (void)imu_mpu6xxx_fifo_reset();
+                last_fifo_resync=imu_mpu6xxx_get_fifo_stats()->fifo_resync_count;
+                startup_zupt=sample_is_still?1U:0U;
+                continue;
+            }
         }
 
         zupt_applied = 0U;
@@ -719,6 +860,10 @@ int main(void)
                 imu_apply_static_calibration(&raw, &settings, accel, gyro);
                 init_filter(&eskf, &raw, &settings);
                 memset(&aid_status,0,sizeof(aid_status)); /* world/yaw alignment invalid after full re-init */
+                memset(&pos_acquisition,0,sizeof(pos_acquisition));
+                memset(&yaw_acquisition,0,sizeof(yaw_acquisition));
+                slip_observer_init(&slip_observer);
+                last_wheel_observer_us=0U; last_effective_wheel_sigma_mps=0.0f;
                 memset(aid_req_valid,0,sizeof(aid_req_valid));
                 zero_rate_sigma = zero_rate_sigma_from_settings(&settings);
                 imu_preintegrator_init(&preintegrator);
@@ -771,6 +916,10 @@ int main(void)
                     eeprom_valid=1; calibration.event_saved_needed=0U;
                     init_filter(&eskf, &raw, &settings);
                     memset(&aid_status,0,sizeof(aid_status));
+                    memset(&pos_acquisition,0,sizeof(pos_acquisition));
+                    memset(&yaw_acquisition,0,sizeof(yaw_acquisition));
+                    slip_observer_init(&slip_observer);
+                    last_wheel_observer_us=0U; last_effective_wheel_sigma_mps=0.0f;
                     memset(aid_req_valid,0,sizeof(aid_req_valid));
                     zero_rate_sigma = zero_rate_sigma_from_settings(&settings);
                     imu_preintegrator_init(&preintegrator);
@@ -883,6 +1032,10 @@ int main(void)
                     if(reset_all){imu_calibration_init(&calibration);filter_health_reset_count=0U;}
                     imu_apply_static_calibration(&raw,&settings,accel,gyro); init_filter(&eskf,&raw,&settings);
                     memset(&aid_status,0,sizeof(aid_status));
+                    memset(&pos_acquisition,0,sizeof(pos_acquisition));
+                    memset(&yaw_acquisition,0,sizeof(yaw_acquisition));
+                    slip_observer_init(&slip_observer);
+                    last_wheel_observer_us=0U; last_effective_wheel_sigma_mps=0.0f;
                     memset(aid_req_valid,0,sizeof(aid_req_valid));
                     imu_preintegrator_init(&preintegrator); (void)imu_mpu6xxx_fifo_reset();
                     last_fifo_resync=imu_mpu6xxx_get_fifo_stats()->fifo_resync_count;
@@ -902,14 +1055,17 @@ int main(void)
                 uint32_t age=0U;
                 uint8_t timing_ok=(uint8_t)aid_age_us(now_us,&req,&age);
                 uint16_t age_ms=(uint16_t)((age/1000U)>65535U?65535U:(age/1000U));
+                uint32_t max_age=aid_source_max_age_us(req.type);
                 uint8_t status=0U; int ok=0;
-                if(!timing_ok || age>AID_MAX_AGE_US){status=4U;aid_status.reject_count++;}
-                else if((req.type==AID_CMD_WHEEL_BODY_X && req.frame!=AID_FRAME_BODY) ||
+                if(!timing_ok || max_age==0U || age>max_age){
+                    status=4U; aid_status.reject_count++;
+                } else if((req.type==AID_CMD_WHEEL_BODY_X && req.frame!=AID_FRAME_BODY) ||
                         (req.type!=AID_CMD_WHEEL_BODY_X && req.frame!=AID_FRAME_LOCAL_ZUP && req.frame!=AID_FRAME_ENU) ||
-                        ((req.type==AID_CMD_WORLD_VELOCITY || req.type==AID_CMD_WORLD_POSITION) && req.frame==AID_FRAME_ENU && !aid_status.enu_aligned)){
+                        ((req.type==AID_CMD_WORLD_VELOCITY || req.type==AID_CMD_WORLD_POSITION) &&
+                         req.frame==AID_FRAME_ENU && !aid_status.enu_aligned)){
                     status=6U; aid_status.reject_count++;
                 } else{
-                    float sigma=req.sigma*(1.0f+(float)age/(float)AID_MAX_AGE_US);
+                    float sigma=req.sigma*(1.0f+(float)age/(float)max_age);
                     if(req.type==AID_CMD_WHEEL_BODY_X){
                         float omega[3],lever_cross[3],target[3]={req.value[0],0.0f,0.0f};
                         if(!isfinite(req.value[0])||fabsf(req.value[0])>AID_WHEEL_MAX_MPS ||
@@ -921,18 +1077,55 @@ int main(void)
                             lever_cross[1]=omega[2]*settings.imu_position_body[0]-omega[0]*settings.imu_position_body[2];
                             lever_cross[2]=omega[0]*settings.imu_position_body[1]-omega[1]*settings.imu_position_body[0];
                             for(int i=0;i<3;i++)target[i]+=lever_cross[i];
-                            if(!aid_recent(now_us,aid_status.last_wheel_us))
-                                eskf_nav_inflate_velocity_uncertainty(&eskf,1.0f);
-                            ok=eskf_nav_fuse_body_velocity(&eskf,target,0x01U,sigma);
-                            if(ok){
-                                aid_status.last_wheel_us=now_us;aid_status.last_any_us=now_us;
-                                if (fabsf(req.value[0]) > MOTION_AID_RELEASE_SPEED_MPS) {
-                                    startup_zupt=0U; auto_rearm_still_count=0U;
-                                }
+
+                            float body_velocity[3]={0.0f,0.0f,0.0f};
+                            float previous_nis=eskf.diagnostics.last_wheel_nis;
+                            if(!isfinite(previous_nis)||previous_nis<0.0f)previous_nis=0.0f;
+                            float observer_dt=0.02f;
+                            if(last_wheel_observer_us!=0U){
+                                observer_dt=(float)((uint32_t)(now_us-last_wheel_observer_us))*1.0e-6f;
+                                if(observer_dt<=0.0f)observer_dt=0.02f;
                             }
-                            if(ok && (req.flags&AID_FLAG_NHC)){
-                                float nhc_sigma=NHC_SIGMA_MPS*(1.0f+(float)age/(float)AID_MAX_AGE_US);
-                                if(eskf_nav_fuse_body_velocity(&eskf,target,0x06U,nhc_sigma))aid_status.last_nhc_us=now_us;
+                            last_wheel_observer_us=now_us;
+                            if(eskf_nav_get_body_velocity(&eskf,body_velocity)){
+                                SlipObserverInput slip_in;
+                                memset(&slip_in,0,sizeof(slip_in));
+                                slip_in.wheel_speed_mps=target[0];
+                                slip_in.predicted_forward_mps=body_velocity[0];
+                                slip_in.wheel_nis=previous_nis;
+                                slip_in.gyro_z_rads=omega[2];
+                                /* Steering angle is not available on this MCU protocol yet.
+                                 * Keep the Ackermann model hook explicit rather than inventing it. */
+                                slip_in.expected_yaw_rate_valid=0U;
+                                slip_in.lateral_accel_mps2=accel_for_gravity[1];
+                                slip_in.dt_s=observer_dt;
+                                slip_observer_update(&slip_observer,&slip_in);
+                            }
+                            last_effective_wheel_sigma_mps=
+                                sigma*slip_observer_wheel_sigma_scale(&slip_observer);
+
+                            if(slip_observer_reject_wheel(&slip_observer)){
+                                status=8U; /* severe slip: controlled rejection */
+                                aid_status.reject_count++;
+                                ok=0;
+                            }else{
+                                if(!aid_recent(now_us,aid_status.last_wheel_us))
+                                    eskf_nav_inflate_velocity_uncertainty(&eskf,1.0f);
+                                ok=eskf_nav_fuse_body_velocity(&eskf,target,0x01U,
+                                                               last_effective_wheel_sigma_mps);
+                                if(ok){
+                                    aid_status.last_wheel_us=now_us;aid_status.last_any_us=now_us;
+                                    if (fabsf(req.value[0]) > MOTION_AID_RELEASE_SPEED_MPS) {
+                                        startup_zupt=0U; auto_rearm_still_count=0U;
+                                    }
+                                }
+                                if(ok && (req.flags&AID_FLAG_NHC)){
+                                    float nhc_sigma=NHC_SIGMA_MPS*
+                                        (1.0f+(float)age/(float)max_age)*
+                                        slip_observer_nhc_sigma_scale(&slip_observer);
+                                    if(eskf_nav_fuse_body_velocity(&eskf,target,0x06U,nhc_sigma))
+                                        aid_status.last_nhc_us=now_us;
+                                }
                             }
                         }
                     }else if(req.type==AID_CMD_WORLD_VELOCITY){
@@ -947,17 +1140,49 @@ int main(void)
                             }
                         }
                     }else if(req.type==AID_CMD_WORLD_POSITION){
-                        if(!aid_recent(now_us,aid_status.last_pos_us))
-                            ok=eskf_nav_reset_world_position(&eskf,req.value,sigma);
-                        else ok=eskf_nav_fuse_world_position(&eskf,req.value,sigma);
-                        if(ok){aid_status.last_pos_us=now_us;aid_status.last_any_us=now_us;}
+                        /* Direct-MCU global position is intentionally fresh-only. Delayed
+                         * GNSS/global fusion should be handled by NUC map->odom until a
+                         * history-buffer/rewind estimator exists on the sideboard. */
+                        if(!aid_recent(now_us,aid_status.last_pos_us)){
+                            if(pos_acquisition.state==AID_SOURCE_TRACKING){
+                                pos_acquisition.state=AID_SOURCE_NO_SOURCE;
+                                pos_acquisition.count=0U;
+                            }
+                            if(position_acquisition_offer(&pos_acquisition,req.value,sigma)){
+                                ok=eskf_nav_reset_world_position(&eskf,req.value,sigma);
+                            }else{
+                                status=7U; /* candidate acquisition in progress */
+                                ok=1;
+                            }
+                        }else{
+                            pos_acquisition.state=AID_SOURCE_TRACKING;
+                            ok=eskf_nav_fuse_world_position(&eskf,req.value,sigma);
+                        }
+                        if(ok && status==0U){
+                            aid_status.last_pos_us=now_us;aid_status.last_any_us=now_us;
+                        }
                     }else if(req.type==AID_CMD_YAW){
-                        if(!aid_recent(now_us,aid_status.last_yaw_us))
-                            ok=eskf_nav_reset_yaw(&eskf,req.value[0],sigma);
-                        else ok=eskf_nav_fuse_yaw(&eskf,req.value[0],sigma);
-                        if(ok){aid_status.last_yaw_us=now_us;aid_status.last_any_us=now_us;if(req.frame==AID_FRAME_ENU)aid_status.enu_aligned=1U;}
+                        if(!aid_recent(now_us,aid_status.last_yaw_us)){
+                            if(yaw_acquisition.state==AID_SOURCE_TRACKING){
+                                yaw_acquisition.state=AID_SOURCE_NO_SOURCE;
+                                yaw_acquisition.count=0U;
+                            }
+                            if(yaw_acquisition_offer(&yaw_acquisition,req.value[0],sigma)){
+                                ok=eskf_nav_reset_yaw(&eskf,req.value[0],sigma);
+                            }else{
+                                status=7U;
+                                ok=1;
+                            }
+                        }else{
+                            yaw_acquisition.state=AID_SOURCE_TRACKING;
+                            ok=eskf_nav_fuse_yaw(&eskf,req.value[0],sigma);
+                        }
+                        if(ok && status==0U){
+                            aid_status.last_yaw_us=now_us;aid_status.last_any_us=now_us;
+                            if(req.frame==AID_FRAME_ENU)aid_status.enu_aligned=1U;
+                        }
                     }
-                    if(!ok){status=1U;aid_status.reject_count++;}
+                    if(!ok && status==0U){status=1U;aid_status.reject_count++;}
                     if(!eskf_nav_is_healthy(&eskf)) {
                         (void)recover_filter_if_unhealthy(&eskf,&raw,&settings,&preintegrator,
                                                          &last_fifo_resync,(uint8_t)sample_is_still,&startup_zupt,&nominal_backup);
@@ -980,6 +1205,45 @@ int main(void)
         if (telemetry_due) {
             (void)vesc_send_extended_imu(&huart2, &telemetry);
             sequence++;
+        }
+
+        if (diag_stream_divider < DIAG_STREAM_DIVIDER) diag_stream_divider++;
+        if (diag_stream_divider >= DIAG_STREAM_DIVIDER &&
+            !telemetry_due && !board_uart_tx_busy()) {
+            VescDiagnosticState diag;
+            memset(&diag,0,sizeof(diag));
+            const ImuRuntimeHealth *dh=imu_mpu6xxx_get_runtime_health();
+            const ImuFifoStats *df=imu_mpu6xxx_get_fifo_stats();
+            BoardRuntimeStats bs;
+            board_get_runtime_stats(&bs);
+            diag.wheel_innovation_mps=eskf.diagnostics.last_wheel_innovation_mps;
+            diag.wheel_nis=eskf.diagnostics.last_wheel_nis;
+            diag.effective_wheel_sigma_mps=last_effective_wheel_sigma_mps;
+            diag.slip_score=slip_observer_get_score(&slip_observer);
+            diag.slip_state=(uint8_t)slip_observer_get_state(&slip_observer);
+            if(dh){
+                diag.accel_clip_mask=dh->last_accel_clip_mask;
+                diag.gyro_clip_mask=dh->last_gyro_clip_mask;
+                diag.imu_config_ok=dh->config_ok;
+                diag.accel_clip_count=dh->accel_clip_count[0]+dh->accel_clip_count[1]+dh->accel_clip_count[2];
+                diag.gyro_clip_count=dh->gyro_clip_count[0]+dh->gyro_clip_count[1]+dh->gyro_clip_count[2];
+                diag.imu_config_mismatch_count=dh->config_mismatch_count;
+                diag.i2c_error_count=dh->i2c_error_count;
+                diag.imu_reinit_count=dh->reinit_count;
+            }
+            if(df){
+                diag.fifo_overflow_count=df->fifo_overflow_count;
+                diag.fifo_resync_count=df->fifo_resync_count;
+                diag.fifo_max_bytes=df->fifo_max_bytes;
+            }
+            diag.scheduler_miss_count=bs.imu_deadline_miss_count;
+            diag.max_pending_ticks=bs.imu_max_pending_ticks;
+            diag.uart_rx_overflow_count=bs.uart_rx_overflow_count;
+            diag.uart_tx_timeout_count=bs.uart_tx_timeout_count;
+            diag.covariance_psd_ok=covariance_psd_ok;
+            diag.aiding_reject_count=aid_status.reject_count;
+            diag.filter_health_reset_count=filter_health_reset_count;
+            if (vesc_send_diagnostic(&huart2,&diag)) diag_stream_divider=0U;
         }
     }
 }

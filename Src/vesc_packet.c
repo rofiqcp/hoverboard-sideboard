@@ -72,6 +72,13 @@ static uint16_t sat_u16(float x)
     return (uint16_t)lrintf(x);
 }
 
+static int16_t sat_i16(float x)
+{
+    if (x >= 32767.0f) return 32767;
+    if (x <= -32768.0f) return -32768;
+    return (int16_t)lrintf(x);
+}
+
 /* Format yang sama dengan buffer_append_float32_auto milik VESC. */
 static void put_float_auto(uint8_t *b, uint16_t *i, float number)
 {
@@ -191,6 +198,40 @@ int vesc_send_extended_imu(UART_HandleTypeDef *uart, const VescImuState *s)
     payload[i++]=s->imu_whoami; payload[i++]=s->imu_class;
     put_u32(payload,&i,(uint32_t)sat_i32(s->observed_sample_hz*1000.0f));
 
+    (void)uart;
+    return send_payload_async(payload, i);
+}
+
+int vesc_send_diagnostic(UART_HandleTypeDef *uart, const VescDiagnosticState *s)
+{
+    if (!s) return 0;
+    uint8_t payload[80];
+    uint16_t i = 0U;
+    payload[i++] = COMM_SIDEBOARD_DIAG;
+    payload[i++] = 1U; /* diagnostic protocol v1 */
+    put_i16(payload, &i, sat_i16(s->wheel_innovation_mps * 1000.0f));
+    put_u16(payload, &i, sat_u16(s->wheel_nis * 100.0f));
+    put_u16(payload, &i, sat_u16(s->effective_wheel_sigma_mps * 1000.0f));
+    put_u16(payload, &i, sat_u16(s->slip_score * 1000.0f));
+    payload[i++] = s->slip_state;
+    payload[i++] = s->accel_clip_mask;
+    payload[i++] = s->gyro_clip_mask;
+    payload[i++] = s->imu_config_ok;
+    put_u32(payload, &i, s->accel_clip_count);
+    put_u32(payload, &i, s->gyro_clip_count);
+    put_u32(payload, &i, s->imu_config_mismatch_count);
+    put_u32(payload, &i, s->i2c_error_count);
+    put_u32(payload, &i, s->imu_reinit_count);
+    put_u32(payload, &i, s->fifo_overflow_count);
+    put_u32(payload, &i, s->fifo_resync_count);
+    put_u16(payload, &i, s->fifo_max_bytes);
+    put_u32(payload, &i, s->scheduler_miss_count);
+    put_u32(payload, &i, s->max_pending_ticks);
+    put_u32(payload, &i, s->uart_rx_overflow_count);
+    put_u32(payload, &i, s->uart_tx_timeout_count);
+    payload[i++] = s->covariance_psd_ok;
+    put_u32(payload, &i, s->aiding_reject_count);
+    put_u32(payload, &i, s->filter_health_reset_count);
     (void)uart;
     return send_payload_async(payload, i);
 }

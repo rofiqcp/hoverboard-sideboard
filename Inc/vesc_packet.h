@@ -95,6 +95,32 @@ typedef struct {
     float sigma;
 } VescAidingRequest;
 
+typedef struct {
+    float wheel_innovation_mps;
+    float wheel_nis;
+    float effective_wheel_sigma_mps;
+    float slip_score;
+    uint8_t slip_state;
+    uint8_t accel_clip_mask;
+    uint8_t gyro_clip_mask;
+    uint8_t imu_config_ok;
+    uint32_t accel_clip_count;
+    uint32_t gyro_clip_count;
+    uint32_t imu_config_mismatch_count;
+    uint32_t i2c_error_count;
+    uint32_t imu_reinit_count;
+    uint32_t fifo_overflow_count;
+    uint32_t fifo_resync_count;
+    uint16_t fifo_max_bytes;
+    uint32_t scheduler_miss_count;
+    uint32_t max_pending_ticks;
+    uint32_t uart_rx_overflow_count;
+    uint32_t uart_tx_timeout_count;
+    uint8_t covariance_psd_ok;
+    uint32_t aiding_reject_count;
+    uint32_t filter_health_reset_count;
+} VescDiagnosticState;
+
 typedef enum {
     VESC_ACTION_NONE=0,
     VESC_ACTION_BOOTLOADER,
@@ -112,6 +138,7 @@ typedef enum {
 
 uint16_t vesc_crc16(const uint8_t *data, uint16_t len);
 int vesc_send_extended_imu(UART_HandleTypeDef *uart, const VescImuState *s);
+int vesc_send_diagnostic(UART_HandleTypeDef *uart, const VescDiagnosticState *s);
 int vesc_send_calibration_status(UART_HandleTypeDef *uart, uint8_t subcmd,
                                  uint8_t status, const VescImuState *s);
 int vesc_send_config_status(UART_HandleTypeDef *uart, uint8_t subcmd, uint8_t status,

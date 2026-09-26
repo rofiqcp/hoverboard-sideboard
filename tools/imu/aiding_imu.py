@@ -8,7 +8,7 @@ from serial_common import open_sideboard_port
 COMM=0xF4; BAUD=921600
 TYPES={"wheel":1,"world-vel":2,"world-pos":3,"yaw":4}
 TIMING={"now":0,"board":1,"age":2}; FRAMES={"local":0,"enu":1,"body":2}
-STATUS={0:"accepted",1:"innovation/range rejected",2:"bad packet",3:"bad sigma",4:"stale/bad timing",5:"ESKF recovered",6:"bad/un-aligned frame",7:"starting/busy"}
+STATUS={0:"accepted",1:"innovation/range rejected",2:"bad packet",3:"bad sigma",4:"stale/bad timing",5:"ESKF recovered",6:"bad/un-aligned frame",7:"starting/busy",8:"severe slip rejected"}
 
 def packet(p):
     c=crc16(p); return bytes((2,len(p)))+p+bytes((c>>8,c&255,3))

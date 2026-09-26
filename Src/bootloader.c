@@ -15,19 +15,28 @@
 #define CMD_WRITE       0xFAU
 #define CMD_GO          0xFBU
 #define CMD_VERIFY      0xFCU
+#define CMD_BEGIN_UPDATE 0xFDU
+#define BOOT_PROTOCOL_VERSION 4U
+#define FLASH_WAIT_TIMEOUT_MS 100U
+#define UART_WAIT_TIMEOUT_MS  20U
 #define BOOT_REQUEST_MAGIC 0xB007U
 #define APP_MANIFEST_MAGIC 0x41505056UL /* APPV */
 
 static uint32_t ms_counter;
 static uint8_t cached_app_valid;
+static uint8_t update_session_active;
 
 typedef struct {
+    /* Prefix is byte-compatible with v3 metadata. */
     uint32_t magic;
     uint32_t length;
     uint32_t length_inv;
     uint16_t crc16;
     uint16_t crc16_inv;
     uint32_t magic_inv;
+    /* v4 adds whole-image CRC32. 0xFFFFFFFF/0xFFFFFFFF means legacy v3. */
+    uint32_t crc32;
+    uint32_t crc32_inv;
 } AppManifest;
 
 static void backup_domain_enable(void)
@@ -75,6 +84,17 @@ static uint16_t crc16(const uint8_t *data, uint16_t len)
             crc = (crc & 0x8000U) ? (uint16_t)((crc << 1) ^ 0x1021U) : (uint16_t)(crc << 1);
     }
     return crc;
+}
+
+static uint32_t crc32_image(const uint8_t *data, uint32_t len)
+{
+    uint32_t crc=0xFFFFFFFFUL;
+    for(uint32_t i=0U;i<len;i++){
+        crc^=data[i];
+        for(uint8_t bit=0U;bit<8U;bit++)
+            crc=(crc&1U)?((crc>>1)^0xEDB88320UL):(crc>>1);
+    }
+    return crc^0xFFFFFFFFUL;
 }
 
 static void hw_init(void)
@@ -126,10 +146,15 @@ static int uart_get(uint8_t *out)
     return 1;
 }
 
-static void uart_put(uint8_t b)
+static int uart_put(uint8_t b)
 {
-    while (!(USART2->SR & USART_SR_TXE)) { watchdog_kick(); }
+    uint32_t start=boot_millis();
+    while (!(USART2->SR & USART_SR_TXE)) {
+        watchdog_kick();
+        if ((uint32_t)(boot_millis()-start) > UART_WAIT_TIMEOUT_MS) return 0;
+    }
     USART2->DR = b;
+    return 1;
 }
 
 static void uart_wait_tx_complete(void)
@@ -146,17 +171,21 @@ static void uart_wait_tx_complete(void)
 static void send_packet(const uint8_t *payload, uint8_t len)
 {
     uint16_t crc = crc16(payload, len);
-    uart_put(2U); uart_put(len);
-    for (uint8_t i=0; i<len; i++) uart_put(payload[i]);
-    uart_put((uint8_t)(crc >> 8));
-    uart_put((uint8_t)crc);
-    uart_put(3U);
+    if(!uart_put(2U) || !uart_put(len)) return;
+    for (uint8_t i=0; i<len; i++) if(!uart_put(payload[i])) return;
+    if(!uart_put((uint8_t)(crc >> 8))) return;
+    if(!uart_put((uint8_t)crc)) return;
+    if(!uart_put(3U)) return;
     uart_wait_tx_complete();
 }
 
 static int flash_wait(void)
 {
-    while (FLASH->SR & FLASH_SR_BSY) { watchdog_kick(); }
+    uint32_t start=boot_millis();
+    while (FLASH->SR & FLASH_SR_BSY) {
+        watchdog_kick();
+        if ((uint32_t)(boot_millis()-start) > FLASH_WAIT_TIMEOUT_MS) return 0;
+    }
     if (FLASH->SR & (FLASH_SR_PGERR | FLASH_SR_WRPRTERR)) {
         FLASH->SR = FLASH_SR_PGERR | FLASH_SR_WRPRTERR;
         return 0;
@@ -233,11 +262,29 @@ static int program_data(uint32_t addr, const uint8_t *data, uint16_t len)
     return 1;
 }
 
-static int image_crc_matches(uint32_t length, uint16_t expected_crc)
+static int image_crc16_matches(uint32_t length, uint16_t expected_crc)
 {
     if (length == 0U || length > (APP_IMAGE_END - APP_START) || length > 65535U) return 0;
     const uint8_t *image = (const uint8_t *)APP_START;
     return crc16(image, (uint16_t)length) == expected_crc;
+}
+
+static int image_crc32_matches(uint32_t length, uint32_t expected_crc)
+{
+    if (length == 0U || length > (APP_IMAGE_END - APP_START)) return 0;
+    return crc32_image((const uint8_t *)APP_START,length)==expected_crc;
+}
+
+static int image_vectors_valid(uint32_t length)
+{
+    if(length<8U || length>(APP_IMAGE_END-APP_START)) return 0;
+    uint32_t sp=*(volatile uint32_t *)APP_START;
+    uint32_t pc=*(volatile uint32_t *)(APP_START+4U);
+    uint32_t pc_addr=pc&~1UL;
+    uint32_t image_end=APP_START+length;
+    if(sp<0x20000000UL || sp>0x20005000UL || (sp&0x3U)) return 0;
+    if((pc&1U)==0U || pc_addr<APP_START || pc_addr>=image_end) return 0;
+    return 1;
 }
 
 static int manifest_header_valid(AppManifest *out)
@@ -246,6 +293,7 @@ static int manifest_header_valid(AppManifest *out)
     AppManifest v;
     v.magic=m->magic; v.length=m->length; v.length_inv=m->length_inv;
     v.crc16=m->crc16; v.crc16_inv=m->crc16_inv; v.magic_inv=m->magic_inv;
+    v.crc32=m->crc32; v.crc32_inv=m->crc32_inv;
     if (v.magic != APP_MANIFEST_MAGIC || v.magic_inv != ~APP_MANIFEST_MAGIC ||
         v.length == 0U || v.length > (APP_IMAGE_END-APP_START) || v.length > 65535U ||
         v.length_inv != ~v.length || v.crc16_inv != (uint16_t)~v.crc16) return 0;
@@ -253,11 +301,22 @@ static int manifest_header_valid(AppManifest *out)
     return 1;
 }
 
-static int write_manifest(uint32_t length, uint16_t crc)
+static int manifest_crc32_is_valid(const AppManifest *m)
+{
+    return m && m->crc32_inv==~m->crc32;
+}
+
+static int manifest_is_legacy_v3(const AppManifest *m)
+{
+    return m && m->crc32==0xFFFFFFFFUL && m->crc32_inv==0xFFFFFFFFUL;
+}
+
+static int write_manifest(uint32_t length, uint16_t crc16_value, uint32_t crc32_value)
 {
     AppManifest m;
     m.magic=APP_MANIFEST_MAGIC; m.length=length; m.length_inv=~length;
-    m.crc16=crc; m.crc16_inv=(uint16_t)~crc; m.magic_inv=~APP_MANIFEST_MAGIC;
+    m.crc16=crc16_value; m.crc16_inv=(uint16_t)~crc16_value; m.magic_inv=~APP_MANIFEST_MAGIC;
+    m.crc32=crc32_value; m.crc32_inv=~crc32_value;
 
     flash_unlock();
     /* VERIFY boleh diulang: metadata page dibuat fresh setiap commit. */
@@ -275,25 +334,27 @@ static int write_manifest(uint32_t length, uint16_t crc)
     }
     flash_lock();
     AppManifest verify;
-    return manifest_header_valid(&verify) && verify.length==length && verify.crc16==crc;
+    return manifest_header_valid(&verify) && verify.length==length &&
+           verify.crc16==crc16_value && manifest_crc32_is_valid(&verify) &&
+           verify.crc32==crc32_value;
 }
 
-static int verify_and_commit_app(uint32_t length, uint16_t expected_crc)
+static int verify_and_commit_app(uint32_t length, uint32_t expected_crc32)
 {
-    if (!image_crc_matches(length,expected_crc)) return 0;
-    return write_manifest(length,expected_crc);
+    if(!image_vectors_valid(length)) return 0;
+    if(!image_crc32_matches(length,expected_crc32)) return 0;
+    uint16_t legacy_crc=crc16((const uint8_t *)APP_START,(uint16_t)length);
+    return write_manifest(length,legacy_crc,expected_crc32);
 }
 
 static int app_valid(void)
 {
-    uint32_t sp = *(volatile uint32_t *)APP_START;
-    uint32_t pc = *(volatile uint32_t *)(APP_START + 4U);
-    uint32_t pc_addr = pc & ~1UL;
     AppManifest m;
-    if (!(sp >= 0x20000000UL && sp <= 0x20005000UL &&
-          pc_addr >= APP_START && pc_addr < APP_IMAGE_END && (pc & 1U))) return 0;
     if (!manifest_header_valid(&m)) return 0;
-    return image_crc_matches(m.length,m.crc16);
+    if (!image_vectors_valid(m.length)) return 0;
+    if (manifest_crc32_is_valid(&m)) return image_crc32_matches(m.length,m.crc32);
+    if (manifest_is_legacy_v3(&m)) return image_crc16_matches(m.length,m.crc16);
+    return 0;
 }
 
 __attribute__((naked, noreturn)) static void jump_raw(uint32_t app_sp, uint32_t app_pc)
@@ -346,8 +407,9 @@ static uint8_t process_payload(const uint8_t *p, uint8_t len)
     if (!p || len == 0U) return 0U;
 
     if (p[0] == CMD_INFO) {
-        boot_request_set();
-        reply[0] = CMD_INFO; reply[1] = 0U; reply[2] = 3U;
+        /* INFO is strictly read-only: no persistent recovery latch and no
+         * transition into update mode merely because a host probed us. */
+        reply[0] = CMD_INFO; reply[1] = 0U; reply[2] = BOOT_PROTOCOL_VERSION;
         put_u32_be(&reply[3], APP_START);
         put_u32_be(&reply[7], APP_IMAGE_END);
         reply[11] = (uint8_t)(PAGE_SIZE >> 8);
@@ -355,11 +417,21 @@ static uint8_t process_payload(const uint8_t *p, uint8_t len)
         reply[13] = 128U;
         reply[14] = cached_app_valid;
         send_packet(reply, 15U);
+        return 0U;
+    }
+
+    if (p[0] == CMD_BEGIN_UPDATE && len == 1U) {
+        boot_request_set();
+        update_session_active=1U;
+        reply[0]=CMD_BEGIN_UPDATE; reply[1]=0U;
+        send_packet(reply,2U);
         return 1U;
     }
 
     if (p[0] == CMD_ERASE && len == 1U) {
-        boot_request_set();
+        if(!update_session_active){
+            reply[0]=CMD_ERASE; reply[1]=3U; send_packet(reply,2U); return 1U;
+        }
         reply[0] = CMD_ERASE;
         reply[1] = erase_app() ? 0U : 1U;
         if (reply[1] == 0U) cached_app_valid = 0U;
@@ -368,7 +440,10 @@ static uint8_t process_payload(const uint8_t *p, uint8_t len)
     }
 
     if (p[0] == CMD_WRITE && len >= 6U) {
-        boot_request_set();
+        if(!update_session_active){
+            reply[0]=CMD_WRITE; reply[1]=3U; put_u32_be(&reply[2],0U);
+            send_packet(reply,6U); return 1U;
+        }
         uint32_t addr = get_u32_be(&p[1]);
         uint16_t data_len = (uint16_t)len - 5U;
         reply[0] = CMD_WRITE;
@@ -378,24 +453,29 @@ static uint8_t process_payload(const uint8_t *p, uint8_t len)
         return 1U;
     }
 
-    if (p[0] == CMD_VERIFY && len == 7U) {
-        boot_request_set();
+    if (p[0] == CMD_VERIFY && len == 9U) {
+        if(!update_session_active){
+            reply[0]=CMD_VERIFY; reply[1]=3U; send_packet(reply,2U); return 1U;
+        }
         uint32_t image_len = get_u32_be(&p[1]);
-        uint16_t expected_crc = ((uint16_t)p[5] << 8) | p[6];
+        uint32_t expected_crc32 = get_u32_be(&p[5]);
         reply[0] = CMD_VERIFY;
-        reply[1] = verify_and_commit_app(image_len, expected_crc) ? 0U : 1U;
+        /* Vector/SP/reset-PC checks and CRC32 all pass before manifest commit. */
+        reply[1] = verify_and_commit_app(image_len, expected_crc32) ? 0U : 1U;
         cached_app_valid = (reply[1] == 0U) ? 1U : 0U;
         send_packet(reply, 2U);
         return 1U;
     }
 
     if (p[0] == CMD_GO && len == 1U) {
-        boot_request_set();
         uint8_t valid = cached_app_valid;
         reply[0] = CMD_GO; reply[1] = valid ? 0U : 1U;
         send_packet(reply, 2U);
-        if (valid) boot_request_clear();
-        if (valid) jump_app();
+        if (valid) {
+            boot_request_clear();
+            update_session_active=0U;
+            jump_app();
+        }
         return 1U;
     }
 
@@ -462,6 +542,7 @@ int main(void)
     cached_app_valid = app_valid() ? 1U : 0U;
     PacketRx rx = {0};
     uint8_t stay_in_boot = boot_request_active();
+    update_session_active=stay_in_boot;
     uint32_t start_ms = boot_millis();
     uint32_t auto_boot_wait = watchdog_reset ? 5000U : BOOT_WAIT_MS;
 

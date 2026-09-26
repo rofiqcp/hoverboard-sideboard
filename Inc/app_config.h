@@ -82,8 +82,22 @@
 #define MOTION_AID_RELEASE_SPEED_MPS           0.05f
 #define ZERO_RATE_SIGMA_RAD                 0.008f
 #define NHC_SIGMA_MPS                         0.05f
-#define AID_MAX_AGE_US                      200000UL
+/* Local MCU ESKF does not rewind history. Freshness is therefore source-specific;
+ * delayed/global position belongs on the NUC map->odom estimator (or a future
+ * history-buffer estimator), not by inflating sigma on an old MCU sample. */
+#define AID_MAX_AGE_US                      200000UL /* legacy compatibility only */
+#define AID_WHEEL_MAX_AGE_US                 50000UL
+#define AID_YAW_MAX_AGE_US                   50000UL
+#define AID_WORLD_VEL_MAX_AGE_US             50000UL
+#define AID_WORLD_POS_MAX_AGE_US             40000UL
 #define AID_STATUS_TIMEOUT_US               500000UL
+#define AID_REACQUIRE_COUNT                      3U
+#define AID_REACQUIRE_POS_FLOOR_M             0.75f
+#define AID_REACQUIRE_POS_SIGMA_MULT           4.0f
+#define AID_REACQUIRE_YAW_FLOOR_RAD          0.17453293f
+#define AID_REACQUIRE_YAW_SIGMA_MULT           4.0f
+#define ESKF_PSD_CHECK_INTERVAL_US          1000000UL
+#define DIAG_STREAM_DIVIDER                     10U
 #define AID_WHEEL_MAX_MPS                      15.0f
 #define AID_WORLD_VEL_MAX_MPS                  30.0f
 #define AID_WORLD_POS_MAX_M                 100000.0f
@@ -114,6 +128,8 @@
 #define COMM_SIDEBOARD_CALIBRATION     0xF2U
 #define COMM_SIDEBOARD_CONFIG          0xF3U
 #define COMM_SIDEBOARD_AIDING          0xF4U
+#define COMM_SIDEBOARD_DIAG            0xF5U
+#define COMM_SIDEBOARD_FAST_NAV        0xF6U /* reserved; optional stream not enabled */
 #define COMM_GET_IMU_DATA              65U
 #define BOOTLOADER_REQUEST_MAGIC       0xB007U
 #define IMU_PROTOCOL_VERSION           5U

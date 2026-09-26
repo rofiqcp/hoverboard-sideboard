@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Flasher UART sederhana untuk bootloader sideboard.
 
-Alur: tangkap bootloader -> INFO -> ERASE -> WRITE per 128 byte -> VERIFY CRC -> GO.
+Alur v4: tangkap bootloader -> INFO -> BEGIN_UPDATE -> ERASE -> WRITE -> VERIFY CRC32 -> GO -> verifikasi aplikasi.
 Semua paket memakai framing pendek dan CRC16 yang sama dengan VESC.
 """
 
@@ -9,6 +9,7 @@ import argparse
 import struct
 import sys
 import time
+import zlib
 from pathlib import Path
 
 import serial
@@ -26,6 +27,8 @@ CMD_ERASE = 0xF9
 CMD_WRITE = 0xFA
 CMD_GO = 0xFB
 CMD_VERIFY = 0xFC
+CMD_BEGIN_UPDATE = 0xFD
+COMM_SIDEBOARD_IMU = 0xF0
 DEFAULT_PORT = "auto"
 DEFAULT_BAUD = 921600
 
@@ -38,6 +41,11 @@ def crc16(data: bytes) -> int:
         for _ in range(8):
             crc = ((crc << 1) ^ 0x1021) & 0xFFFF if crc & 0x8000 else (crc << 1) & 0xFFFF
     return crc
+
+
+def crc32_image(data: bytes) -> int:
+    """CRC32 IEEE whole-image, sama dengan bootloader v4."""
+    return zlib.crc32(data) & 0xFFFFFFFF
 
 
 def make_packet(payload: bytes) -> bytes:
@@ -216,19 +224,60 @@ def acquire_bootloader(requested, baud, handshake=4.0, overall=35.0):
     raise TimeoutError(f"Tidak bisa acquire bootloader setelah reconnect: {last}")
 
 
+def wait_for_application(port: serial.Serial, timeout: float = 6.0):
+    """Tunggu bukti runtime: extended IMU protocol v5 setelah GO."""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        payload = read_packet(port, min(0.35, max(deadline - time.monotonic(), 0.02)))
+        if payload and len(payload) >= 2 and payload[0] == COMM_SIDEBOARD_IMU and payload[1] >= 5:
+            return payload
+    return None
+
+
+def verify_application_boot(port: serial.Serial, timeout: float = 6.0):
+    """CRC success is not runtime success; require application telemetry."""
+    payload = wait_for_application(port, timeout)
+    if payload is not None:
+        return payload
+    try:
+        info = catch_bootloader(port, 1.0)
+        version, *_ = parse_info(info)
+        raise RuntimeError(
+            f"APP_BOOT_FAILED: bootloader v{version} reacquired, aplikasi tidak memberi telemetry"
+        )
+    except TimeoutError:
+        raise RuntimeError(
+            "APP_BOOT_FAILED: tidak ada telemetry aplikasi dan bootloader tidak dapat direacquire"
+        )
+
+
 def flash_image(port: serial.Serial, image: bytes, info: bytes):
-    """Erase, tulis image, lalu verifikasi CRC keseluruhan."""
+    """Erase/write/verify image; v4 uses BEGIN_UPDATE + whole-image CRC32."""
     version, start, end, page, suggested_chunk, app_valid = parse_info(info)
     if version < 3:
-        raise RuntimeError("Bootloader legacy v%d tidak punya manifest power-loss-safe; flash BOOTLOADER_STLINK v3 dulu" % version)
+        raise RuntimeError(
+            "Bootloader legacy v%d tidak punya manifest power-loss-safe; flash BOOTLOADER_STLINK v4 dulu"
+            % version
+        )
     if len(image) == 0 or len(image) > end - start:
         raise ValueError(f"Ukuran firmware {len(image)} byte di luar area aplikasi {end-start} byte")
 
     chunk = min(max(suggested_chunk, 2), 128)
     if chunk & 1:
         chunk -= 1
-    print(f"Bootloader v{version} | app 0x{start:08X}..0x{end-1:08X} | "
-          f"page={page} | app_lama_valid={app_valid}")
+    print(
+        f"Bootloader v{version} | app 0x{start:08X}..0x{end-1:08X} | "
+        f"page={page} | app_lama_valid={app_valid}"
+    )
+
+    if version >= 4:
+        r = transact_retry(
+            port, bytes((CMD_BEGIN_UPDATE,)), CMD_BEGIN_UPDATE, timeout=1.0, attempts=3
+        )
+        if len(r) < 2 or r[1] != 0:
+            raise RuntimeError("BEGIN_UPDATE ditolak")
+        print("BEGIN_UPDATE OK; recovery latch aktif.")
+
     print("Menghapus area aplikasi ...")
     r = transact_retry(port, bytes((CMD_ERASE,)), CMD_ERASE, timeout=8.0, attempts=2)
     if len(r) < 2 or r[1] != 0:
@@ -243,20 +292,33 @@ def flash_image(port: serial.Serial, image: bytes, info: bytes):
         if len(r) < 6 or r[1] != 0 or struct.unpack_from(">I", r, 2)[0] != addr:
             raise RuntimeError(f"Write gagal pada 0x{addr:08X}")
         done = min(off + len(data), total)
-        print(f"\rMenulis {done:6d}/{total:6d} byte ({done*100/total:5.1f}%)", end="", flush=True)
+        print(
+            f"\rMenulis {done:6d}/{total:6d} byte ({done*100/total:5.1f}%)",
+            end="",
+            flush=True,
+        )
     print()
 
-    image_crc = crc16(image)
-    verify = bytes((CMD_VERIFY,)) + struct.pack(">I", total) + struct.pack(">H", image_crc)
+    if version >= 4:
+        image_crc = crc32_image(image)
+        verify = bytes((CMD_VERIFY,)) + struct.pack(">I", total) + struct.pack(">I", image_crc)
+        label = f"CRC32=0x{image_crc:08X}"
+    else:
+        image_crc = crc16(image)
+        verify = bytes((CMD_VERIFY,)) + struct.pack(">I", total) + struct.pack(">H", image_crc)
+        label = f"CRC16=0x{image_crc:04X}"
+
     r = transact_retry(port, verify, CMD_VERIFY, timeout=2.0, attempts=2)
     if len(r) < 2 or r[1] != 0:
-        raise RuntimeError(f"VERIFY CRC gagal (host CRC=0x{image_crc:04X})")
-    print(f"VERIFY CRC OK: 0x{image_crc:04X}")
+        raise RuntimeError(f"VERIFY gagal ({label})")
+    print(f"VERIFY OK: {label}")
 
     r = transact(port, bytes((CMD_GO,)), CMD_GO, timeout=1.0)
     if len(r) < 2 or r[1] != 0:
         raise RuntimeError("GO ditolak bootloader")
-    print("Firmware valid, aplikasi dijalankan.")
+
+    app = verify_application_boot(port, timeout=6.0)
+    print(f"Application runtime verified: protocol v{app[1]} telemetry valid.")
 
 
 def main():
