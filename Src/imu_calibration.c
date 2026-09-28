@@ -155,13 +155,13 @@ static void update_rotate(ImuCalibration *c,const ImuSample *s)
     c->progress=(uint16_t)((accepted*1000U)/(6U*ROTATE_FACE_MIN_SAMPLES));
 }
 
-void imu_calibration_update(ImuCalibration *c,const ImuSample *s,PersistedSettings *set)
+void imu_calibration_update(ImuCalibration *c,const ImuSample *raw,PersistedSettings *settings)
 {
-    if (!c || !s || !set) return;
+    if (!c || !raw || !settings) return;
     c->total_seen++;
 
     if (c->state==IMU_CAL_STILL) {
-        if (!sample_still(s)) {
+        if (!sample_still(raw)) {
             clear_still_accumulator(c);
             if (c->total_seen > MASTER_STILL_CAL_SAMPLES*10U) {
                 c->state=IMU_CAL_FAILED;
@@ -170,16 +170,16 @@ void imu_calibration_update(ImuCalibration *c,const ImuSample *s,PersistedSettin
             return;
         }
         for (int i=0;i<3;i++) {
-            float g=s->gyro_rads[i], a=s->accel_mps2[i];
+            float g=raw->gyro_rads[i], a=raw->accel_mps2[i];
             c->sum_g[i]+=g; c->sum_g2[i]+=g*g;
             c->sum_a[i]+=a; c->sum_a2[i]+=a*a;
         }
-        c->sum_temp+=s->temperature_c;
+        c->sum_temp+=raw->temperature_c;
         c->samples++;
         c->progress=(uint16_t)((c->samples*1000U)/MASTER_STILL_CAL_SAMPLES);
-        if (c->samples>=MASTER_STILL_CAL_SAMPLES) (void)finish_still(c,set);
+        if (c->samples>=MASTER_STILL_CAL_SAMPLES) (void)finish_still(c,settings);
     } else if (c->state==IMU_CAL_ROTATE) {
-        update_rotate(c,s);
+        update_rotate(c,raw);
     }
 }
 

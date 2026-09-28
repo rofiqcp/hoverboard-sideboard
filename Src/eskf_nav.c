@@ -143,7 +143,7 @@ static void reset_covariance_attitude(EskfNav *f, const float dtheta[3]) {
     }
     for (int r=0;r<3;r++) for (int c=0;c<ESKF_NAV_DIM;c++) f->P[IDX_TH+r][c]=HPm[r][c];
     for (int r=0;r<ESKF_NAV_DIM;r++) {
-        float old[3]={f->P[r][IDX_TH],f->P[r][IDX_TH+1],f->P[r][IDX_TH+2]};
+        const float old[3]={f->P[r][IDX_TH],f->P[r][IDX_TH+1],f->P[r][IDX_TH+2]};
         float out[3]={0};
         for (int c=0;c<3;c++) for (int k=0;k<3;k++) out[c]+=old[k]*G[c][k];
         for (int c=0;c<3;c++) f->P[r][IDX_TH+c]=out[c];
@@ -493,7 +493,7 @@ int eskf_nav_predict_delta_scaled(EskfNav *f, const float delta_angle[3],
         dv_world[r]+=Rmid[r][c]*dvel_body[c];
     dv_world[2]-=GRAVITY_MPS2*dt;
 
-    float v_old[3]={f->velocity[0],f->velocity[1],f->velocity[2]};
+    const float v_old[3]={f->velocity[0],f->velocity[1],f->velocity[2]};
     for (int i=0;i<3;i++) f->velocity[i]+=dv_world[i];
     for (int i=0;i<3;i++)
         f->position[i]+=0.5f*(v_old[i]+f->velocity[i])*dt;
@@ -512,14 +512,6 @@ int eskf_nav_predict_delta(EskfNav *f, const float delta_angle[3],
     return eskf_nav_predict_delta_scaled(f,delta_angle,delta_velocity,dt,1.0f,1.0f);
 }
 
-void eskf_nav_predict(EskfNav *f, const float gyro[3], const float accel[3], float dt)
-{
-    if (!gyro || !accel || dt<=0.0f) return;
-    float da[3],dv[3];
-    for (int i=0;i<3;i++) { da[i]=gyro[i]*dt; dv[i]=accel[i]*dt; }
-    (void)eskf_nav_predict_delta(f,da,dv,dt);
-}
-
 int eskf_nav_correct_gravity(EskfNav *f, const float accel[3], int stationary)
 {
     if (!f || !accel || !f->initialized) return 0;
@@ -533,7 +525,7 @@ int eskf_nav_correct_gravity(EskfNav *f, const float accel[3], int stationary)
     float gate_max=stationary ? ESKF_ACCEL_GATE_MAX_G : ESKF_MOVING_ACCEL_GATE_MAX_G;
     if (gr<gate_min || gr>gate_max) { f->gravity_reject_count++; return 0; }
 
-    float z[3]={a[0]/n,a[1]/n,a[2]/n};
+    const float z[3]={a[0]/n,a[1]/n,a[2]/n};
     float h[3]; gravity_body(f,h);
     float dir_dot=z[0]*h[0]+z[1]*h[1]+z[2]*h[2];
     float dir_gate=stationary ? ESKF_GRAVITY_DIR_COS_STILL : ESKF_GRAVITY_DIR_COS_MOVING;

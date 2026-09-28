@@ -1,4 +1,5 @@
 #include <math.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <string.h>
 #include "app_config.h"
@@ -6,6 +7,15 @@
 
 static int failures=0;
 static void check(int ok,const char *msg){printf("%s: %s\n",ok?"PASS":"FAIL",msg);if(!ok)failures++;}
+static uint32_t rng_state=0x12345678U;
+static float rand_uniform(void){
+ rng_state=1664525U*rng_state+1013904223U;
+ return ((float)(rng_state>>8)+1.0f)/16777217.0f;
+}
+static float rand_gaussian(void){
+ float u1=rand_uniform(),u2=rand_uniform();
+ return sqrtf(-2.0f*logf(u1))*cosf(6.28318530717958647692f*u2);
+}
 static float qdot(const float a[4],const float b[4]){return a[0]*b[0]+a[1]*b[1]+a[2]*b[2]+a[3]*b[3];}
 static void qconj(const float q[4],float o[4]){o[0]=q[0];o[1]=-q[1];o[2]=-q[2];o[3]=-q[3];}
 static void qmul(const float a[4],const float b[4],float o[4]){
@@ -13,6 +23,15 @@ static void qmul(const float a[4],const float b[4],float o[4]){
  o[1]=a[0]*b[1]+a[1]*b[0]+a[2]*b[3]-a[3]*b[2];
  o[2]=a[0]*b[2]-a[1]*b[3]+a[2]*b[0]+a[3]*b[1];
  o[3]=a[0]*b[3]+a[1]*b[2]-a[2]*b[1]+a[3]*b[0];
+}
+static void qright_axis(float q[4],int axis,float angle){
+ float dq[4]={cosf(0.5f*angle),0.0f,0.0f,0.0f},out[4];
+ dq[axis+1]=sinf(0.5f*angle); qmul(q,dq,out); memcpy(q,out,sizeof(out));
+}
+static float body_x_measurement(const EskfNav *f){
+ float R[3][3]; eskf_nav_rotation_matrix(f,R); float bx=0.0f;
+ for(int w=0;w<3;w++)bx+=R[w][0]*f->velocity[w];
+ return bx;
 }
 
 static void test_covariance_phase_invariance(void){
@@ -50,6 +69,36 @@ static void test_atomic_vector_updates(void){
        "rejected body velocity is atomic");
 }
 
+static void test_body_velocity_jacobian(void){
+ const float deg=0.01745329251994329577f,r=12.0f*deg,p=-8.0f*deg,y=35.0f*deg,g=GRAVITY_MPS2;
+ float a0[3]={-sinf(p)*g,sinf(r)*cosf(p)*g,cosf(r)*cosf(p)*g}; EskfNav f;
+ eskf_nav_init(&f,a0); check(eskf_nav_reset_yaw(&f,y,0.05f),"body-velocity test yaw initialized");
+ f.velocity[0]=2.0f; f.velocity[1]=-0.7f; f.velocity[2]=0.2f;
+ memset(f.P,0,sizeof(f.P)); for(int i=0;i<ESKF_NAV_DIM;i++)f.P[i][i]=1e-9f;
+ for(int i=0;i<3;i++){f.P[i][i]=0.01f;f.P[3+i][3+i]=0.04f;}
+ EskfNav before=f; const float eps=1e-4f,sigma=0.10f,innov=0.08f;
+ float H[6]={0.0f};
+ for(int axis=0;axis<3;axis++){
+  EskfNav plus=before,minus=before; qright_axis(plus.q,axis,eps);qright_axis(minus.q,axis,-eps);
+  H[axis]=(body_x_measurement(&plus)-body_x_measurement(&minus))/(2.0f*eps);
+ }
+ for(int axis=0;axis<3;axis++){
+  EskfNav plus=before,minus=before;plus.velocity[axis]+=eps;minus.velocity[axis]-=eps;
+  H[3+axis]=(body_x_measurement(&plus)-body_x_measurement(&minus))/(2.0f*eps);
+ }
+ float S=sigma*sigma;for(int i=0;i<3;i++){S+=0.01f*H[i]*H[i];S+=0.04f*H[3+i]*H[3+i];}
+ float measurement[3]={body_x_measurement(&before)+innov,0.0f,0.0f};
+ check(eskf_nav_fuse_body_velocity(&f,measurement,0x01U,sigma),"body-x velocity update accepted at tilted pose");
+ float qc[4],dq[4];qconj(before.q,qc);qmul(qc,f.q,dq);if(dq[0]<0.0f)for(int i=0;i<4;i++)dq[i]=-dq[i];
+ float actual_th[3]={2.0f*dq[1],2.0f*dq[2],2.0f*dq[3]};
+ int ok=1;for(int i=0;i<3;i++){
+  float eth=0.01f*H[i]*innov/S,ev=0.04f*H[3+i]*innov/S;
+  if(fabsf(actual_th[i]-eth)>0.0025f||fabsf((f.velocity[i]-before.velocity[i])-ev)>0.0025f)ok=0;
+ }
+ check(ok,"body-velocity update matches finite-difference right-error Jacobian");
+ check(eskf_nav_covariance_psd_check(&f),"body-velocity update preserves PSD covariance");
+}
+
 static void test_gravity_tangent_update(void){
  const float tilt=2.0f*0.01745329251994329577f,g=GRAVITY_MPS2;
  float ainit[3]={0.0f,sinf(tilt)*g,cosf(tilt)*g}, level[3]={0.0f,0.0f,g}; EskfNav f;
@@ -59,6 +108,26 @@ static void test_gravity_tangent_update(void){
  eskf_nav_get_euler_deg(&f,&r1,&p1,&y1);
  check(fabsf(r1)<fabsf(r0) && fabsf(p1)<=fabsf(p0)+1e-5f,"gravity tangent update reduces tilt error");
  check(eskf_nav_covariance_psd_check(&f),"gravity tangent update preserves PSD covariance");
+}
+
+static void test_process_noise_nees_consistency(void){
+ const int runs=256,steps=100; const float dt=0.01f,g=GRAVITY_MPS2,sigma_a=0.18f;
+ double nees_sum=0.0,err2_sum=0.0,p_sum=0.0; rng_state=0x12345678U;
+ for(int run=0;run<runs;run++){
+  float a0[3]={0.0f,0.0f,g}; EskfNav f; eskf_nav_init(&f,a0);
+  memset(f.P,0,sizeof(f.P)); for(int i=0;i<ESKF_NAV_DIM;i++)f.P[i][i]=1e-9f;
+  f.gyro_noise=1e-6f; f.accel_noise=sigma_a; f.gyro_bias_walk=0.0f; f.accel_bias_walk=0.0f;
+  for(int k=0;k<steps;k++){
+   float accel_noise=sigma_a/sqrtf(dt)*rand_gaussian();
+   float da[3]={0.0f,0.0f,0.0f},dv[3]={accel_noise*dt,0.0f,g*dt};
+   if(!eskf_nav_predict_delta(&f,da,dv,dt)){failures++;return;}
+  }
+  double err=f.velocity[0],var=f.P[3][3];
+  nees_sum+=err*err/var; err2_sum+=err*err; p_sum+=var;
+ }
+ double nees=nees_sum/(double)runs,ratio=err2_sum/p_sum;
+ check(nees>0.80 && nees<1.20,"Monte-Carlo velocity NEES matches configured accel process noise");
+ check(ratio>0.80 && ratio<1.20,"empirical velocity error variance matches propagated covariance");
 }
 
 static void test_fast_covariance_health_check(void){
@@ -141,7 +210,9 @@ static void test_tilted_yaw_jacobian(void){
 int main(void){
  test_covariance_phase_invariance();
  test_atomic_vector_updates();
+ test_body_velocity_jacobian();
  test_gravity_tangent_update();
+ test_process_noise_nees_consistency();
  test_fast_covariance_health_check();
  test_bias_bound_covariance_consistency();
  test_clipping_noise_scaling();
