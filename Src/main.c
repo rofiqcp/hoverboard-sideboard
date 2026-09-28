@@ -614,8 +614,20 @@ int main(void)
         }
     }
 
+    /* Startup stationary sudah mengakumulasi ~2 s data. Gunakan mean window
+     * sebagai gravity vector awal; memakai satu sampel terakhir membuang SNR
+     * yang sudah diperoleh dari quality-gated startup measurement. */
+    ImuSample init_sample=raw;
+    if(startup.stationary && startup.valid>0U){
+        for(int i=0;i<3;i++){
+            init_sample.accel_mps2[i]=startup.accel_avg[i];
+            init_sample.gyro_rads[i]=startup.gyro_avg[i];
+        }
+        init_sample.temperature_c=startup.temperature_avg;
+    }
+
     EskfNav eskf;
-    init_filter(&eskf, &raw, &settings);
+    init_filter(&eskf, &init_sample, &settings);
     EskfNominalBackup nominal_backup={0};
     nominal_backup_update(&nominal_backup,&eskf);
 

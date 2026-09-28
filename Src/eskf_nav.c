@@ -198,6 +198,20 @@ static int invert_spd_small(const float S[3][3], uint8_t m, float inv[3][3])
     return 1;
 }
 
+static void bound_gain_row(float Krow[3],uint8_t m,float *dx,
+                           float current,float limit,uint32_t *saturation_count)
+{
+    float requested=*dx;
+    float bounded=clampf_local(current+requested,-limit,limit);
+    float applied=bounded-current;
+    if(fabsf(applied-requested)<=1e-9f)return;
+    float scale=(fabsf(requested)>1e-12f)?applied/requested:0.0f;
+    scale=clampf_local(scale,0.0f,1.0f);
+    for(uint8_t j=0U;j<m;j++)Krow[j]*=scale;
+    *dx=applied;
+    if(saturation_count)(*saturation_count)++;
+}
+
 static int update_joint_dense(EskfNav *f,
                               const float H[3][ESKF_NAV_DIM],
                               const float innov[3], const float variance[3],
@@ -276,6 +290,16 @@ static int update_joint_dense(EskfNav *f,
             dxm[r]*=gain_scale;
             for (uint8_t j=0U;j<m;j++) K[r][j]*=gain_scale;
         }
+    }
+
+    /* Bias hard-bounds are part of the applied measurement model. Limit the
+     * corresponding gain row before Joseph covariance update; clamping only
+     * the nominal bias afterwards would make P claim a correction not applied. */
+    for(int i=0;i<3;i++){
+        bound_gain_row(K[IDX_BG+i],m,&dxm[IDX_BG+i],f->gyro_bias[i],
+                       ESKF_GYRO_BIAS_LIMIT_RAD,&f->diagnostics.bias_saturation_count);
+        bound_gain_row(K[IDX_BA+i],m,&dxm[IDX_BA+i],f->accel_bias[i],
+                       ESKF_ACCEL_BIAS_LIMIT_MPS2,&f->diagnostics.bias_saturation_count);
     }
 
     for (int r=0;r<ESKF_NAV_DIM;r++) for (int c=r;c<ESKF_NAV_DIM;c++) {
@@ -926,6 +950,16 @@ int eskf_nav_nominal_is_healthy(const EskfNav *f)
     return 1;
 }
 
+static int covariance_block3_psd(const EskfNav *f,int start)
+{
+    float a=f->P[start][start], b=f->P[start][start+1], c=f->P[start][start+2];
+    float d=f->P[start+1][start+1], e=f->P[start+1][start+2], q=f->P[start+2][start+2];
+    float det=a*d*q+2.0f*b*c*e-a*e*e-d*c*c-q*b*b;
+    float scale=fmaxf(a,fmaxf(d,q));
+    float tol=1e-12f+1e-5f*scale*scale*scale;
+    return isfinite(det) && det>=-tol;
+}
+
 int eskf_nav_is_healthy(const EskfNav *f)
 {
     if(!eskf_nav_nominal_is_healthy(f))return 0;
@@ -940,6 +974,8 @@ int eskf_nav_is_healthy(const EskfNav *f)
         float bound=f->P[r][r]*f->P[c][c]*1.02f + 1e-12f;
         if(x*x>bound) return 0;
     }
+    for(int start=0;start<ESKF_NAV_DIM;start+=3)
+        if(!covariance_block3_psd(f,start))return 0;
     return 1;
 }
 

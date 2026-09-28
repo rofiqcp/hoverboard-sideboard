@@ -61,6 +61,28 @@ static void test_gravity_tangent_update(void){
  check(eskf_nav_covariance_psd_check(&f),"gravity tangent update preserves PSD covariance");
 }
 
+static void test_fast_covariance_health_check(void){
+ const float g=GRAVITY_MPS2; float a0[3]={0.0f,0.0f,g}; EskfNav f; eskf_nav_init(&f,a0);
+ for(int i=0;i<3;i++)for(int j=0;j<3;j++)f.P[i][j]=(i==j)?1.0f:-0.9f;
+ check(!eskf_nav_is_healthy(&f),"fast health check rejects indefinite 3x3 attitude covariance");
+ check(!eskf_nav_covariance_psd_check(&f),"full PSD check agrees with fast block rejection");
+}
+
+static void test_bias_bound_covariance_consistency(void){
+ const float g=GRAVITY_MPS2; float a0[3]={0.0f,0.0f,g}; EskfNav f; eskf_nav_init(&f,a0);
+ f.gyro_bias[0]=ESKF_GYRO_BIAS_LIMIT_RAD-0.001f;
+ float gyro[3]={0.20f,0.0f,0.0f};
+ check(eskf_nav_fuse_zero_rate(&f,gyro,0.008f),"zero-rate update near gyro-bias bound accepted");
+ check(f.gyro_bias[0]<=ESKF_GYRO_BIAS_LIMIT_RAD+1e-7f &&
+       f.gyro_bias[0]>=ESKF_GYRO_BIAS_LIMIT_RAD-2e-6f,
+       "gyro-bias correction respects configured hard bound");
+ check(f.diagnostics.bias_saturation_count>=1U,"bias-bound gain limiting is diagnosed");
+ check(eskf_nav_covariance_psd_check(&f),"bias-bound gain limiting preserves PSD covariance");
+ float p_after=f.P[9][9];
+ check(eskf_nav_fuse_zero_rate(&f,gyro,0.008f),"repeated outward bias update remains numerically valid");
+ check(f.P[9][9]>=p_after*0.999f,"saturated bias covariance does not collapse from unapplied correction");
+}
+
 static void test_clipping_noise_scaling(void){
  const float g=GRAVITY_MPS2,dt=0.01f; float a0[3]={0.0f,0.0f,g}; EskfNav normal,clipped;
  eskf_nav_init(&normal,a0); clipped=normal;
@@ -120,6 +142,8 @@ int main(void){
  test_covariance_phase_invariance();
  test_atomic_vector_updates();
  test_gravity_tangent_update();
+ test_fast_covariance_health_check();
+ test_bias_bound_covariance_consistency();
  test_clipping_noise_scaling();
  test_imu_gap_covariance_inflation();
  test_tilted_yaw_jacobian();

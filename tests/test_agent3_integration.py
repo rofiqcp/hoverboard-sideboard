@@ -36,6 +36,13 @@ class Agent3IntegrationTests(unittest.TestCase):
         self.assertIn("aid_source_max_age_us(req.type)", main)
         self.assertNotIn("age>AID_MAX_AGE_US", main)
 
+    def test_stationary_startup_initializes_eskf_from_averaged_imu(self):
+        main = open(MAIN, encoding="utf-8").read()
+        self.assertIn("init_sample.accel_mps2[i]=startup.accel_avg[i]", main)
+        self.assertIn("init_sample.gyro_rads[i]=startup.gyro_avg[i]", main)
+        self.assertIn("init_sample.temperature_c=startup.temperature_avg", main)
+        self.assertIn("init_filter(&eskf, &init_sample, &settings)", main)
+
     def test_reacquisition_guard_requires_three_candidates(self):
         cfg = open(CONFIG, encoding="utf-8").read()
         main = open(MAIN, encoding="utf-8").read()

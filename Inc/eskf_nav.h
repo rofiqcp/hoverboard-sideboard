@@ -33,6 +33,7 @@ typedef struct {
     uint32_t position_reject_count;
     uint32_t covariance_repair_count;
     uint32_t imu_gap_count;
+    uint32_t bias_saturation_count;
     float last_imu_gap_s;
     float max_imu_gap_s;
 
