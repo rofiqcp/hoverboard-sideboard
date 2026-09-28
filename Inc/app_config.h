@@ -45,11 +45,13 @@
 #define ESKF_GYRO_BIAS_WALK_RAD        0.0010f
 #define ESKF_ACCEL_BIAS_WALK           0.010f
 #define ESKF_ACCEL_DIR_NOISE           0.060f
-#define ESKF_ACCEL_NIS_GATE             16.0f
-#define ESKF_GRAVITY_SCALAR_NIS_GATE      9.0f
+#define ESKF_NIS_GATE_1D                  9.0f
+#define ESKF_NIS_GATE_2D                 11.829007f
+#define ESKF_NIS_GATE_3D                 14.156253f
+#define ESKF_GRAVITY_NIS_GATE_2D         ESKF_NIS_GATE_2D
 #define ESKF_GRAVITY_DIR_COS_STILL          0.99756405f /* 4 deg */
 #define ESKF_GRAVITY_DIR_COS_MOVING         0.99862953f /* 3 deg */
-#define ESKF_COVARIANCE_DIVIDER           2U
+#define ESKF_COVARIANCE_DIVIDER           1U
 
 /* Kalibrasi awal 2 detik pada 100 Hz. Jika board diam, bias gyro hasil rata-rata
  * dipakai pada sesi ini. Jika EEPROM belum valid, hasil ini juga disimpan sekali. */

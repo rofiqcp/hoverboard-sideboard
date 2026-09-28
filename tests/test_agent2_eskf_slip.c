@@ -233,12 +233,12 @@ static void test_eskf_agent2_api(void)
         eskf_nav_get_diagnostics(&f,&d);
         check(d.velocity_accept_count==1U &&
               d.last_velocity_innovation_norm_mps>0.0f &&
-              isfinite(d.last_velocity_nis_max),
-              "world velocity diagnostics expose norm and max NIS");
+              isfinite(d.last_velocity_nis),
+              "world velocity diagnostics expose norm and joint NIS");
         check(d.position_accept_count==1U &&
               d.last_position_innovation_norm_m>0.0f &&
-              isfinite(d.last_position_nis_max),
-              "world position diagnostics expose norm and max NIS");
+              isfinite(d.last_position_nis),
+              "world position diagnostics expose norm and joint NIS");
     }
 }
 

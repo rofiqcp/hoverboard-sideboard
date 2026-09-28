@@ -19,9 +19,9 @@ typedef struct {
     float last_yaw_innovation_rad;
     float last_yaw_nis;
     float last_velocity_innovation_norm_mps;
-    float last_velocity_nis_max;
+    float last_velocity_nis;
     float last_position_innovation_norm_m;
-    float last_position_nis_max;
+    float last_position_nis;
 
     uint32_t wheel_accept_count;
     uint32_t wheel_reject_count;
