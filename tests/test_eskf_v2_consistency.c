@@ -61,6 +61,24 @@ static void test_gravity_tangent_update(void){
  check(eskf_nav_covariance_psd_check(&f),"gravity tangent update preserves PSD covariance");
 }
 
+static void test_imu_gap_covariance_inflation(void){
+ const float g=GRAVITY_MPS2,gap=0.05f; float a0[3]={0.0f,0.0f,g}; EskfNav f; eskf_nav_init(&f,a0);
+ float pth=f.P[0][0],pv=f.P[3][3],pp=f.P[6][6],pvp=f.P[3][6];
+ float sg=f.gyro_noise*ESKF_IMU_GAP_NOISE_SCALE,sa=f.accel_noise*ESKF_IMU_GAP_NOISE_SCALE;
+ float qg=sg*sg*gap,qa=sa*sa*gap,qp=sa*sa*gap*gap*gap/3.0f,qpv=sa*sa*gap*gap*0.5f;
+ check(eskf_nav_inflate_for_imu_gap(&f,gap),"IMU gap covariance inflation accepted");
+ check(fabsf((f.P[0][0]-pth)-qg)<1e-6f,"IMU gap attitude variance follows integrated gyro noise");
+ check(fabsf((f.P[3][3]-pv)-qa)<1e-6f,"IMU gap velocity variance follows integrated accel noise");
+ check(fabsf((f.P[6][6]-pp)-qp)<1e-6f && fabsf((f.P[3][6]-pvp)-qpv)<1e-6f,
+       "IMU gap position and velocity-position covariance use continuous-noise discretization");
+ check(f.diagnostics.imu_gap_count==1U && fabsf(f.diagnostics.last_imu_gap_s-gap)<1e-7f &&
+       fabsf(f.diagnostics.max_imu_gap_s-gap)<1e-7f,"IMU gap diagnostics track count/last/max");
+ check(eskf_nav_covariance_psd_check(&f),"IMU gap inflation preserves PSD covariance");
+ unsigned before=f.diagnostics.imu_gap_count;
+ check(!eskf_nav_inflate_for_imu_gap(&f,-0.1f) && f.diagnostics.imu_gap_count==before,
+       "invalid IMU gap is rejected without mutating diagnostics");
+}
+
 static void test_tilted_yaw_jacobian(void){
  const float r=20.0f*0.01745329251994329577f, p=15.0f*0.01745329251994329577f, g=GRAVITY_MPS2;
  float a0[3]={-sinf(p)*g,sinf(r)*cosf(p)*g,cosf(r)*cosf(p)*g}; EskfNav f; eskf_nav_init(&f,a0);
@@ -82,6 +100,7 @@ int main(void){
  test_covariance_phase_invariance();
  test_atomic_vector_updates();
  test_gravity_tangent_update();
+ test_imu_gap_covariance_inflation();
  test_tilted_yaw_jacobian();
  return failures?1:0;
 }

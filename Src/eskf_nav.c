@@ -822,6 +822,40 @@ void eskf_nav_inflate_velocity_uncertainty(EskfNav *f,float sigma_prior)
     for(int i=0;i<3;i++)if(f->P[IDX_V+i][IDX_V+i]<v)f->P[IDX_V+i][IDX_V+i]=v;
 }
 
+int eskf_nav_inflate_for_imu_gap(EskfNav *f,float gap_s)
+{
+    if(!f||!f->initialized||!isfinite(gap_s)||gap_s<=0.0f||gap_s>10.0f)return 0;
+
+    /* During a gap there is no inertial sample with which to propagate the
+     * nominal state. Represent the missing input as inflated continuous white
+     * gyro/accel noise and discretize it over the full missing interval. */
+    float gyro_density=f->gyro_noise*ESKF_IMU_GAP_NOISE_SCALE;
+    float accel_density=f->accel_noise*ESKF_IMU_GAP_NOISE_SCALE;
+    float qg=gyro_density*gyro_density*gap_s;
+    float qa=accel_density*accel_density*gap_s;
+    float qpv=accel_density*accel_density*gap_s*gap_s*0.5f;
+    float qp=accel_density*accel_density*gap_s*gap_s*gap_s*(1.0f/3.0f);
+    float qbg=f->gyro_bias_walk*f->gyro_bias_walk*gap_s;
+    float qba=f->accel_bias_walk*f->accel_bias_walk*gap_s;
+    if(!isfinite(qg)||!isfinite(qa)||!isfinite(qpv)||!isfinite(qp)||
+       !isfinite(qbg)||!isfinite(qba))return 0;
+
+    for(int i=0;i<3;i++){
+        f->P[IDX_TH+i][IDX_TH+i]+=qg;
+        f->P[IDX_V+i][IDX_V+i]+=qa;
+        f->P[IDX_V+i][IDX_P+i]+=qpv;
+        f->P[IDX_P+i][IDX_V+i]=f->P[IDX_V+i][IDX_P+i];
+        f->P[IDX_P+i][IDX_P+i]+=qp;
+        f->P[IDX_BG+i][IDX_BG+i]+=qbg;
+        f->P[IDX_BA+i][IDX_BA+i]+=qba;
+    }
+    covariance_floor_diagonal(f);
+    f->diagnostics.imu_gap_count++;
+    f->diagnostics.last_imu_gap_s=gap_s;
+    if(gap_s>f->diagnostics.max_imu_gap_s)f->diagnostics.max_imu_gap_s=gap_s;
+    return eskf_nav_is_healthy(f);
+}
+
 int eskf_nav_reset_world_velocity(EskfNav *f,const float velocity[3],float sigma)
 {
     if(!f||!velocity||!isfinite(sigma)||sigma<AID_SIGMA_VEL_MIN_MPS||sigma>AID_SIGMA_VEL_MAX_MPS)return 0;

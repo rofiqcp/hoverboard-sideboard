@@ -98,7 +98,9 @@
 #define AID_REACQUIRE_POS_SIGMA_MULT           4.0f
 #define AID_REACQUIRE_YAW_FLOOR_RAD          0.17453293f
 #define AID_REACQUIRE_YAW_SIGMA_MULT           4.0f
-#define ESKF_PSD_CHECK_INTERVAL_US          1000000UL
+#define ESKF_PSD_CHECK_INTERVAL_US           100000UL
+#define ESKF_IMU_GAP_NOISE_SCALE                10.0f
+#define ESKF_IMU_GAP_MIN_US                    20000UL
 #define DIAG_STREAM_DIVIDER                     10U
 #define AID_WHEEL_MAX_MPS                      15.0f
 #define AID_WORLD_VEL_MAX_MPS                  30.0f

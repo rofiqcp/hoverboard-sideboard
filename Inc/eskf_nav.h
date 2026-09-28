@@ -32,6 +32,9 @@ typedef struct {
     uint32_t position_accept_count;
     uint32_t position_reject_count;
     uint32_t covariance_repair_count;
+    uint32_t imu_gap_count;
+    float last_imu_gap_s;
+    float max_imu_gap_s;
 
     uint8_t covariance_psd_ok;
     uint8_t last_wheel_reason;
@@ -84,6 +87,7 @@ int eskf_nav_reset_world_velocity(EskfNav *f, const float velocity_mps[3], float
 int eskf_nav_reset_world_position(EskfNav *f, const float position_m[3], float sigma_m);
 int eskf_nav_reset_yaw(EskfNav *f, float yaw_rad, float sigma_rad);
 void eskf_nav_inflate_velocity_uncertainty(EskfNav *f, float sigma_prior_mps);
+int eskf_nav_inflate_for_imu_gap(EskfNav *f, float gap_s);
 void eskf_nav_get_std(const EskfNav *f, float attitude_rad[3],
                       float velocity_mps[3], float position_m[3]);
 int eskf_nav_is_healthy(const EskfNav *f);

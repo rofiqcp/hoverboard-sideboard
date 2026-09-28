@@ -298,6 +298,17 @@ static void init_filter(EskfNav *eskf,
     eskf->accel_dir_noise = settings->accel_dir_noise;
 }
 
+static void account_imu_gap(EskfNav *eskf,uint32_t now_us,uint32_t *last_predict_us)
+{
+    if(!eskf||!last_predict_us)return;
+    if(*last_predict_us!=0U){
+        uint32_t gap_us=(uint32_t)(now_us-*last_predict_us);
+        if(gap_us>=ESKF_IMU_GAP_MIN_US)
+            (void)eskf_nav_inflate_for_imu_gap(eskf,(float)gap_us*1.0e-6f);
+    }
+    *last_predict_us=now_us;
+}
+
 static int recover_filter_if_unhealthy(EskfNav *eskf,
                                       const ImuSample *raw,
                                       const PersistedSettings *settings,
@@ -626,6 +637,7 @@ int main(void)
     uint32_t sequence = 0U;
     uint32_t imu_error_streak = 0U;
     uint32_t last_fifo_resync = imu_mpu6xxx_get_fifo_stats()->fifo_resync_count;
+    uint32_t last_imu_predict_us = board_micros();
 
     /* ZUPT otomatis hanya diizinkan dari keadaan boot diam sampai gerak pertama.
      * Sesudah AGV mulai bergerak, ZUPT hanya dilakukan atas perintah master. */
@@ -684,6 +696,7 @@ int main(void)
                 last_imu_config_recovery_us=now_us;
                 board_i2c_recover();
                 if (imu_mpu6xxx_init()) {
+                    account_imu_gap(&eskf,now_us,&last_imu_predict_us);
                     imu_preintegrator_init(&preintegrator);
                     last_fifo_resync=imu_mpu6xxx_get_fifo_stats()->fifo_resync_count;
                 }
@@ -697,9 +710,11 @@ int main(void)
             service_bootloader_while_starting();
             if (++imu_error_streak >= IMU_REINIT_ERROR_COUNT) {
                 board_i2c_recover();
-                (void)imu_mpu6xxx_init();
-                imu_preintegrator_init(&preintegrator);
-                last_fifo_resync = imu_mpu6xxx_get_fifo_stats()->fifo_resync_count;
+                if (imu_mpu6xxx_init()) {
+                    account_imu_gap(&eskf,now_us,&last_imu_predict_us);
+                    imu_preintegrator_init(&preintegrator);
+                    last_fifo_resync = imu_mpu6xxx_get_fifo_stats()->fifo_resync_count;
+                }
                 imu_error_streak = 0U;
             }
             continue;
@@ -709,7 +724,10 @@ int main(void)
         const ImuFifoStats *fifo_stats = imu_mpu6xxx_get_fifo_stats();
         const ImuRuntimeHealth *imu_health = imu_mpu6xxx_get_runtime_health();
         if (fifo_stats->fifo_resync_count != last_fifo_resync) {
-            /* Jangan menghubungkan dua sisi gap/overflow sebagai satu interval IMU. */
+            /* Jangan menghubungkan dua sisi gap/overflow sebagai satu interval IMU.
+             * State nominal dibekukan selama data hilang, sehingga covariance
+             * harus mengakui uncertainty dari inertial input yang tidak teramati. */
+            account_imu_gap(&eskf,now_us,&last_imu_predict_us);
             imu_preintegrator_init(&preintegrator);
             last_fifo_resync = fifo_stats->fifo_resync_count;
         }
@@ -747,6 +765,7 @@ int main(void)
             aid_status.reject_count++;
             continue;
         }
+        last_imu_predict_us=now_us;
 
         float accel_for_gravity[3], gyro_for_still[3];
         float inv_delta_dt=1.0f/delta.dt;
