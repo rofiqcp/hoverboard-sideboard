@@ -75,6 +75,26 @@ class Agent3IntegrationTests(unittest.TestCase):
         self.assertTrue(d["covariance_psd_ok"])
         self.assertEqual(d["filter_health_reset_count"], 13)
 
+    def test_diagnostic_v2_appends_imu_gap_fields(self):
+        prefix = struct.pack(
+            ">BBhHHHBBBB7IH4IBII",
+            read_imu.COMM_SIDEBOARD_DIAG, 2,
+            -250, 725, 125, 640,
+            2, 1, 4, 1,
+            10, 20, 3, 4, 5, 6, 7,
+            144,
+            8, 9, 10, 11,
+            1,
+            12, 13,
+        )
+        payload = prefix + struct.pack(">IHH", 14, 125, 880)
+        self.assertEqual(len(payload), 77)
+        d = read_imu.decode_diag(payload)
+        self.assertEqual(d["version"], 2)
+        self.assertEqual(d["imu_gap_count"], 14)
+        self.assertEqual(d["last_imu_gap_ms"], 125)
+        self.assertEqual(d["max_imu_gap_ms"], 880)
+
     def test_legacy_v5_decode_unchanged(self):
         payload = bytearray(114)
         payload[0] = read_imu.COMM_SIDEBOARD_IMU

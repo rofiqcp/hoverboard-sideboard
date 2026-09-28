@@ -208,7 +208,7 @@ int vesc_send_diagnostic(UART_HandleTypeDef *uart, const VescDiagnosticState *s)
     uint8_t payload[80];
     uint16_t i = 0U;
     payload[i++] = COMM_SIDEBOARD_DIAG;
-    payload[i++] = 1U; /* diagnostic protocol v1 */
+    payload[i++] = 2U; /* v2 appends IMU-gap diagnostics; v1 prefix stays byte-identical. */
     put_i16(payload, &i, sat_i16(s->wheel_innovation_mps * 1000.0f));
     put_u16(payload, &i, sat_u16(s->wheel_nis * 100.0f));
     put_u16(payload, &i, sat_u16(s->effective_wheel_sigma_mps * 1000.0f));
@@ -232,6 +232,9 @@ int vesc_send_diagnostic(UART_HandleTypeDef *uart, const VescDiagnosticState *s)
     payload[i++] = s->covariance_psd_ok;
     put_u32(payload, &i, s->aiding_reject_count);
     put_u32(payload, &i, s->filter_health_reset_count);
+    put_u32(payload, &i, s->imu_gap_count);
+    put_u16(payload, &i, s->last_imu_gap_ms);
+    put_u16(payload, &i, s->max_imu_gap_ms);
     (void)uart;
     return send_payload_async(payload, i);
 }

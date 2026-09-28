@@ -298,6 +298,14 @@ static void init_filter(EskfNav *eskf,
     eskf->accel_dir_noise = settings->accel_dir_noise;
 }
 
+static uint16_t seconds_to_milliseconds_sat(float seconds)
+{
+    if(!isfinite(seconds)||seconds<=0.0f)return 0U;
+    float ms=seconds*1000.0f;
+    if(ms>=65535.0f)return 65535U;
+    return (uint16_t)(ms+0.5f);
+}
+
 static void account_imu_gap(EskfNav *eskf,uint32_t now_us,uint32_t *last_predict_us)
 {
     if(!eskf||!last_predict_us)return;
@@ -1262,6 +1270,9 @@ int main(void)
             diag.covariance_psd_ok=covariance_psd_ok;
             diag.aiding_reject_count=aid_status.reject_count;
             diag.filter_health_reset_count=filter_health_reset_count;
+            diag.imu_gap_count=eskf.diagnostics.imu_gap_count;
+            diag.last_imu_gap_ms=seconds_to_milliseconds_sat(eskf.diagnostics.last_imu_gap_s);
+            diag.max_imu_gap_ms=seconds_to_milliseconds_sat(eskf.diagnostics.max_imu_gap_s);
             if (vesc_send_diagnostic(&huart2,&diag)) diag_stream_divider=0U;
         }
     }

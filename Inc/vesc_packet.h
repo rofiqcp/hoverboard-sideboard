@@ -119,6 +119,9 @@ typedef struct {
     uint8_t covariance_psd_ok;
     uint32_t aiding_reject_count;
     uint32_t filter_health_reset_count;
+    uint32_t imu_gap_count;
+    uint16_t last_imu_gap_ms;
+    uint16_t max_imu_gap_ms;
 } VescDiagnosticState;
 
 typedef enum {

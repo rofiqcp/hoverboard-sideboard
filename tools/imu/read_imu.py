@@ -132,11 +132,11 @@ def decode_imu(payload: bytes):
     return data
 
 def decode_diag(payload: bytes):
-    """Decode fixed-point diagnostic packet v1 (0xF5) without changing v5 telemetry."""
-    if not payload or payload[0] != COMM_SIDEBOARD_DIAG or len(payload) != 69:
+    """Decode fixed-point diagnostic packet. v2 appends IMU-gap fields to the v1 prefix."""
+    if not payload or payload[0] != COMM_SIDEBOARD_DIAG or len(payload) not in (69, 77):
         return None
-    f = struct.unpack(">BBhHHHBBBB7IH4IBII", payload)
-    return {
+    f = struct.unpack(">BBhHHHBBBB7IH4IBII", payload[:69])
+    data = {
         "version": f[1],
         "wheel_innovation_mps": f[2] / 1000.0,
         "wheel_nis": f[3] / 100.0,
@@ -161,7 +161,16 @@ def decode_diag(payload: bytes):
         "covariance_psd_ok": bool(f[22]),
         "aiding_reject_count": f[23],
         "filter_health_reset_count": f[24],
+        "imu_gap_count": 0,
+        "last_imu_gap_ms": 0,
+        "max_imu_gap_ms": 0,
     }
+    if len(payload) == 77:
+        if data["version"] < 2:
+            return None
+        gap_count, last_ms, max_ms = struct.unpack(">IHH", payload[69:77])
+        data.update(imu_gap_count=gap_count, last_imu_gap_ms=last_ms, max_imu_gap_ms=max_ms)
+    return data
 
 
 def format_diag(d: dict) -> str:
@@ -177,7 +186,8 @@ def format_diag(d: dict) -> str:
         f"schedMiss={d['scheduler_miss_count']} pendingMax={d['max_pending_ticks']} "
         f"uartRxOv={d['uart_rx_overflow_count']} uartTxTO={d['uart_tx_timeout_count']} "
         f"PSD={'ok' if d['covariance_psd_ok'] else 'BAD'} "
-        f"aidReject={d['aiding_reject_count']} healthReset={d['filter_health_reset_count']}"
+        f"aidReject={d['aiding_reject_count']} healthReset={d['filter_health_reset_count']} "
+        f"imuGap={d['imu_gap_count']} last={d['last_imu_gap_ms']}ms max={d['max_imu_gap_ms']}ms"
     )
 
 
