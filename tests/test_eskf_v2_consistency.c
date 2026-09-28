@@ -61,6 +61,26 @@ static void test_gravity_tangent_update(void){
  check(eskf_nav_covariance_psd_check(&f),"gravity tangent update preserves PSD covariance");
 }
 
+static void test_clipping_noise_scaling(void){
+ const float g=GRAVITY_MPS2,dt=0.01f; float a0[3]={0.0f,0.0f,g}; EskfNav normal,clipped;
+ eskf_nav_init(&normal,a0); clipped=normal;
+ float da[3]={0.002f,-0.001f,0.003f},dv[3]={0.01f,-0.005f,g*dt};
+ check(eskf_nav_predict_delta(&normal,da,dv,dt),"normal-noise propagation accepted");
+ check(eskf_nav_predict_delta_scaled(&clipped,da,dv,dt,ESKF_CLIP_NOISE_SCALE,ESKF_CLIP_NOISE_SCALE),
+       "clip-scaled propagation accepted");
+ check(fabsf(normal.q[0]-clipped.q[0])<1e-7f && fabsf(normal.q[1]-clipped.q[1])<1e-7f &&
+       fabsf(normal.q[2]-clipped.q[2])<1e-7f && fabsf(normal.q[3]-clipped.q[3])<1e-7f &&
+       fabsf(normal.velocity[0]-clipped.velocity[0])<1e-7f &&
+       fabsf(normal.velocity[1]-clipped.velocity[1])<1e-7f &&
+       fabsf(normal.velocity[2]-clipped.velocity[2])<1e-7f,
+       "noise scaling changes covariance but not nominal propagation");
+ check(clipped.P[0][0]>normal.P[0][0] && clipped.P[3][3]>normal.P[3][3] && clipped.P[6][6]>normal.P[6][6],
+       "clip-scaled propagation increases attitude/velocity/position uncertainty");
+ check(eskf_nav_covariance_psd_check(&clipped),"clip-scaled covariance remains PSD");
+ check(!eskf_nav_predict_delta_scaled(&clipped,da,dv,dt,0.5f,1.0f),
+       "invalid sub-unity noise scale is rejected");
+}
+
 static void test_imu_gap_covariance_inflation(void){
  const float g=GRAVITY_MPS2,gap=0.05f; float a0[3]={0.0f,0.0f,g}; EskfNav f; eskf_nav_init(&f,a0);
  float pth=f.P[0][0],pv=f.P[3][3],pp=f.P[6][6],pvp=f.P[3][6];
@@ -100,6 +120,7 @@ int main(void){
  test_covariance_phase_invariance();
  test_atomic_vector_updates();
  test_gravity_tangent_update();
+ test_clipping_noise_scaling();
  test_imu_gap_covariance_inflation();
  test_tilted_yaw_jacobian();
  return failures?1:0;

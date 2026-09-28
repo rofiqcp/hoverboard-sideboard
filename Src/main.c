@@ -766,7 +766,10 @@ int main(void)
             service_bootloader_while_starting();
             continue;
         }
-        if (!eskf_nav_predict_delta(&eskf, delta.delta_angle, delta.delta_velocity, delta.dt)) {
+        float gyro_noise_scale=(imu_health && imu_health->last_gyro_clip_mask) ? ESKF_CLIP_NOISE_SCALE : 1.0f;
+        float accel_noise_scale=(imu_health && imu_health->last_accel_clip_mask) ? ESKF_CLIP_NOISE_SCALE : 1.0f;
+        if (!eskf_nav_predict_delta_scaled(&eskf, delta.delta_angle, delta.delta_velocity, delta.dt,
+                                           gyro_noise_scale, accel_noise_scale)) {
             /* Delta dan dt harus selalu merepresentasikan interval yang sama.
              * Jangan clamp dt sambil tetap memakai delta penuh. */
             imu_preintegrator_init(&preintegrator);
@@ -785,7 +788,7 @@ int main(void)
         int sample_is_still = stillness_update(&stillness, accel_for_gravity, gyro_for_still, &eskf);
         /* Clipped values remain untouched for observability/diagnostics, but a
          * clipped acceleration batch cannot be trusted as a gravity/rest cue. */
-        if (imu_health && imu_health->last_accel_clip_mask) sample_is_still=0;
+        if (imu_health && (imu_health->last_accel_clip_mask || imu_health->last_gyro_clip_mask)) sample_is_still=0;
         if(recover_filter_if_unhealthy(&eskf,&raw,&settings,&preintegrator,
                                       &last_fifo_resync,(uint8_t)sample_is_still,&startup_zupt,&nominal_backup)) {
             aid_status.reject_count++;

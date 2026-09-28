@@ -75,6 +75,9 @@ void eskf_nav_predict(EskfNav *f, const float gyro_rads[3],
                       const float accel_mps2[3], float dt);
 int eskf_nav_predict_delta(EskfNav *f, const float delta_angle[3],
                            const float delta_velocity[3], float dt);
+int eskf_nav_predict_delta_scaled(EskfNav *f, const float delta_angle[3],
+                                  const float delta_velocity[3], float dt,
+                                  float gyro_noise_scale, float accel_noise_scale);
 int eskf_nav_correct_gravity(EskfNav *f, const float accel_mps2[3], int stationary);
 int eskf_nav_fuse_zero_velocity(EskfNav *f, float sigma_mps);
 int eskf_nav_fuse_zero_rate(EskfNav *f, const float gyro_rads[3], float sigma_rads);

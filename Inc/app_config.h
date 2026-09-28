@@ -101,6 +101,7 @@
 #define ESKF_PSD_CHECK_INTERVAL_US           100000UL
 #define ESKF_IMU_GAP_NOISE_SCALE                10.0f
 #define ESKF_IMU_GAP_MIN_US                    20000UL
+#define ESKF_CLIP_NOISE_SCALE                     25.0f
 #define DIAG_STREAM_DIVIDER                     10U
 #define AID_WHEEL_MAX_MPS                      15.0f
 #define AID_WORLD_VEL_MAX_MPS                  30.0f

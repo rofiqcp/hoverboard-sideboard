@@ -358,7 +358,8 @@ void eskf_nav_linear_accel_world(const EskfNav *f,const float accel[3],float out
 }
 
 static void covariance_predict(EskfNav *f, const float w[3], const float fb[3],
-                               const float R[3][3], float dt)
+                               const float R[3][3], float dt,
+                               float gyro_noise_scale, float accel_noise_scale)
 {
     f->predict_count++;
     f->covariance_dt_accum += dt;
@@ -420,16 +421,18 @@ static void covariance_predict(EskfNav *f, const float w[3], const float fb[3],
         f->P[r][c]=v; f->P[c][r]=v;
     }
 
-    float qg=f->gyro_noise*f->gyro_noise*cov_dt;
-    float qa=f->accel_noise*f->accel_noise*cov_dt;
+    float gyro_noise=f->gyro_noise*gyro_noise_scale;
+    float accel_noise=f->accel_noise*accel_noise_scale;
+    float qg=gyro_noise*gyro_noise*cov_dt;
+    float qa=accel_noise*accel_noise*cov_dt;
     float qbg=f->gyro_bias_walk*f->gyro_bias_walk*cov_dt;
     float qba=f->accel_bias_walk*f->accel_bias_walk*cov_dt;
     for (int i=0;i<3;i++) {
         f->P[IDX_TH+i][IDX_TH+i]+=qg;
         f->P[IDX_V+i][IDX_V+i]+=qa;
         /* White acceleration noise also contributes to position and v-p cross covariance. */
-        float qpv=f->accel_noise*f->accel_noise*cov_dt*cov_dt*0.5f;
-        float qp=f->accel_noise*f->accel_noise*cov_dt*cov_dt*cov_dt*(1.0f/3.0f);
+        float qpv=accel_noise*accel_noise*cov_dt*cov_dt*0.5f;
+        float qp=accel_noise*accel_noise*cov_dt*cov_dt*cov_dt*(1.0f/3.0f);
         f->P[IDX_V+i][IDX_P+i]+=qpv; f->P[IDX_P+i][IDX_V+i]=f->P[IDX_V+i][IDX_P+i];
         f->P[IDX_P+i][IDX_P+i]+=qp;
         f->P[IDX_BG+i][IDX_BG+i]+=qbg;
@@ -438,11 +441,15 @@ static void covariance_predict(EskfNav *f, const float w[3], const float fb[3],
     covariance_floor_diagonal(f);
 }
 
-int eskf_nav_predict_delta(EskfNav *f, const float delta_angle[3],
-                            const float delta_velocity[3], float dt)
+int eskf_nav_predict_delta_scaled(EskfNav *f, const float delta_angle[3],
+                                  const float delta_velocity[3], float dt,
+                                  float gyro_noise_scale, float accel_noise_scale)
 {
     if (!f || !f->initialized || !delta_angle || !delta_velocity ||
-        !isfinite(dt) || dt < 0.001f || dt > 0.050f) return 0;
+        !isfinite(dt) || dt < 0.001f || dt > 0.050f ||
+        !isfinite(gyro_noise_scale) || !isfinite(accel_noise_scale) ||
+        gyro_noise_scale < 1.0f || accel_noise_scale < 1.0f ||
+        gyro_noise_scale > 100.0f || accel_noise_scale > 100.0f) return 0;
 
     float dtheta[3], dvel_body[3], half_theta[3];
     for (int i=0;i<3;i++) {
@@ -471,8 +478,14 @@ int eskf_nav_predict_delta(EskfNav *f, const float delta_angle[3],
 
     float inv_dt=1.0f/dt, w[3], fb[3];
     for (int i=0;i<3;i++) { w[i]=dtheta[i]*inv_dt; fb[i]=dvel_body[i]*inv_dt; }
-    covariance_predict(f,w,fb,Rmid,dt);
+    covariance_predict(f,w,fb,Rmid,dt,gyro_noise_scale,accel_noise_scale);
     return 1;
+}
+
+int eskf_nav_predict_delta(EskfNav *f, const float delta_angle[3],
+                           const float delta_velocity[3], float dt)
+{
+    return eskf_nav_predict_delta_scaled(f,delta_angle,delta_velocity,dt,1.0f,1.0f);
 }
 
 void eskf_nav_predict(EskfNav *f, const float gyro[3], const float accel[3], float dt)
