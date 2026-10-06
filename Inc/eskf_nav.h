@@ -84,6 +84,9 @@ int eskf_nav_fuse_world_velocity(EskfNav *f, const float velocity_mps[3], float 
 int eskf_nav_fuse_world_position(EskfNav *f, const float position_m[3], float sigma_m);
 int eskf_nav_fuse_body_velocity(EskfNav *f, const float velocity_body_mps[3],
                                 uint8_t axis_mask, float sigma_mps);
+/* Non-mutating pre-gate for the current forward-wheel measurement. */
+int eskf_nav_preview_body_x_nis(const EskfNav *f, float velocity_body_x_mps,
+                                float sigma_mps, float *innovation_mps, float *nis);
 int eskf_nav_fuse_yaw(EskfNav *f, float yaw_rad, float sigma_rad);
 int eskf_nav_reset_world_velocity(EskfNav *f, const float velocity_mps[3], float sigma_mps);
 int eskf_nav_reset_world_position(EskfNav *f, const float position_m[3], float sigma_m);

@@ -32,6 +32,8 @@ static ImuDeviceInfo info;
 static ImuFifoStats fifo_stats;
 static ImuRuntimeHealth runtime_health;
 static uint32_t sample_index;
+static uint32_t last_fifo_sample_time_us;
+static uint8_t have_fifo_sample_time;
 static int16_t temperature_raw_cache;
 static uint8_t temperature_read_divider;
 static int write_reg(uint8_t reg, uint8_t value)
@@ -121,6 +123,8 @@ int imu_mpu6xxx_fifo_reset(void)
      * observed_sample_hz terakhir, tetapi mulai pengukuran window dari nol. */
     fifo_stats.rate_window_start_us=0U;
     fifo_stats.rate_window_samples=0U;
+    last_fifo_sample_time_us=0U;
+    have_fifo_sample_time=0U;
     if (!write_reg(REG_FIFO_EN, 0x00U)) return 0;
     if (!write_reg(REG_USER_CTRL, USER_FIFO_RESET)) return 0;
     HAL_Delay(2U);
@@ -216,6 +220,8 @@ int imu_mpu6xxx_init(void)
     memset(&fifo_stats, 0, sizeof(fifo_stats));
     fifo_stats.observed_sample_hz = (float)MPU6XXX_SAMPLE_HZ;
     sample_index = 0U;
+    last_fifo_sample_time_us = 0U;
+    have_fifo_sample_time = 0U;
     temperature_raw_cache = 0;
     temperature_read_divider = 0U;
 
@@ -357,6 +363,9 @@ int imu_mpu6xxx_read_fifo(ImuSample *samples, uint8_t max_samples, uint8_t *out_
         timestamp_hz = (float)info.sample_hz;
     }
     uint32_t sample_period_us = (uint32_t)(1000000.0f / timestamp_hz + 0.5f);
+    uint32_t first_sample_time_us = have_fifo_sample_time ?
+        last_fifo_sample_time_us + sample_period_us :
+        now_us - (uint32_t)(packet_count - 1U) * sample_period_us;
     for (uint8_t n = 0U; n < packet_count; n++) {
         const uint8_t *b = &fifo_b[(uint16_t)n * FIFO_PACKET_BYTES];
         ImuSample *s = &samples[n];
@@ -368,11 +377,13 @@ int imu_mpu6xxx_read_fifo(ImuSample *samples, uint8_t max_samples, uint8_t *out_
         s->gyro_raw[1] = be_i16(&b[8]);
         s->gyro_raw[2] = be_i16(&b[10]);
         s->temp_raw = temp_raw;
-        s->sample_time_us = now_us - (uint32_t)(packet_count - 1U - n) * sample_period_us;
+        s->sample_time_us = first_sample_time_us + (uint32_t)n * sample_period_us;
         s->sample_index = sample_index++;
         convert_sample(s);
         note_fifo_clipping(s);
     }
+    last_fifo_sample_time_us = samples[packet_count - 1U].sample_time_us;
+    have_fifo_sample_time = 1U;
 
     fifo_stats.fifo_sample_count += packet_count;
     *out_count = packet_count;

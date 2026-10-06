@@ -488,7 +488,7 @@ VescAction vesc_process_rx(UART_HandleTypeDef *uart,
             /* Format modern v1: type,timing,frame,time_or_age,...
              * Format modern v2 menambah request_id uint16 untuk retry idempotent.
              * Format lama tetap diterima untuk backward compatibility. */
-            int modern_v2=(rx.len==17U || rx.len==24U || rx.len==16U);
+            int modern_v2=(rx.len==17U || rx.len==21U || rx.len==24U || rx.len==16U);
             int modern_v1=(rx.len==15U || rx.len==22U || rx.len==14U);
             int modern=(modern_v1 || modern_v2);
             if(modern){
@@ -510,10 +510,16 @@ VescAction vesc_process_rx(UART_HandleTypeDef *uart,
                 pending_aiding.timing_mode=pending_aiding.time_us?AID_TIMING_BOARD_US:AID_TIMING_NOW;
                 pending_aiding.frame=(pending_aiding.type==AID_CMD_WHEEL_BODY_X)?AID_FRAME_BODY:AID_FRAME_LOCAL_ZUP;
             }
-            if(pending_aiding.type==AID_CMD_WHEEL_BODY_X && ((modern_v2&&rx.len==17U)||(modern_v1&&rx.len==15U)||(!modern&&rx.len==13U))){
+            if(pending_aiding.type==AID_CMD_WHEEL_BODY_X &&
+               ((modern_v2&&(rx.len==17U||rx.len==21U))||
+                (modern_v1&&rx.len==15U)||(!modern&&rx.len==13U))){
                 pending_aiding.value[0]=(float)get_i32(&rx.payload[base])*0.001f;
                 pending_aiding.sigma=(float)get_u16(&rx.payload[base+4U])*0.001f;
                 pending_aiding.flags=rx.payload[base+6U];
+                if((pending_aiding.flags&AID_FLAG_EXPECTED_YAW_RATE) && modern_v2&&rx.len==21U)
+                    pending_aiding.value[1]=(float)get_i32(&rx.payload[base+7U])*0.001f;
+                else
+                    pending_aiding.flags&=(uint8_t)~AID_FLAG_EXPECTED_YAW_RATE;
             }else if((pending_aiding.type==AID_CMD_WORLD_VELOCITY || pending_aiding.type==AID_CMD_WORLD_POSITION) && ((modern_v2&&rx.len==24U)||(modern_v1&&rx.len==22U)||(!modern&&rx.len==20U))){
                 for(int k=0;k<3;k++)pending_aiding.value[k]=(float)get_i32(&rx.payload[base+4U*k])*0.001f;
                 pending_aiding.sigma=(float)get_u16(&rx.payload[base+12U])*0.001f;

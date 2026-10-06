@@ -32,6 +32,8 @@
 #define AID_CMD_WORLD_POSITION  3U
 #define AID_CMD_YAW             4U
 #define AID_FLAG_NHC            (1U << 0)
+/* Optional wheel extension: value[1] carries expected yaw-rate in rad/s. */
+#define AID_FLAG_EXPECTED_YAW_RATE (1U << 1)
 
 #define AID_TIMING_NOW          0U
 #define AID_TIMING_BOARD_US     1U

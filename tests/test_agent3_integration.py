@@ -12,8 +12,10 @@ if TOOLS not in sys.path:
 
 import flash_uart
 import read_imu
+import aiding_imu
 
 MAIN = os.path.join(ROOT, "Src", "main.c")
+IMU_DRIVER = os.path.join(ROOT, "Src", "imu_mpu6xxx.c")
 BOOT = os.path.join(ROOT, "Src", "bootloader.c")
 CONFIG = os.path.join(ROOT, "Inc", "app_config.h")
 
@@ -28,7 +30,7 @@ def boot_info(version=4, start=0x08001800, end=0x0800F400, page=1024, chunk=128,
 class Agent3IntegrationTests(unittest.TestCase):
     def test_source_specific_freshness_limits(self):
         cfg = open(CONFIG, encoding="utf-8").read()
-        self.assertIn("#define AID_WHEEL_MAX_AGE_US                 50000UL", cfg)
+        self.assertIn("#define AID_WHEEL_MAX_AGE_US                 30000UL", cfg)
         self.assertIn("#define AID_YAW_MAX_AGE_US                   50000UL", cfg)
         self.assertIn("#define AID_WORLD_VEL_MAX_AGE_US             50000UL", cfg)
         self.assertIn("#define AID_WORLD_POS_MAX_AGE_US             40000UL", cfg)
@@ -57,8 +59,30 @@ class Agent3IntegrationTests(unittest.TestCase):
         self.assertIn("slip_observer_wheel_sigma_scale", main)
         self.assertIn("slip_observer_nhc_sigma_scale", main)
         self.assertIn("slip_observer_reject_wheel", main)
-        self.assertIn("expected_yaw_rate_valid=0U", main)
+        self.assertIn("AID_FLAG_EXPECTED_YAW_RATE", main)
+        self.assertIn("eskf_nav_preview_body_x_nis", main)
         self.assertIn("!telemetry_due && !board_uart_tx_busy()", main)
+
+    def test_wheel_v2_optional_expected_yaw_rate_is_backward_compatible(self):
+        base = dict(command="wheel", values=[3.25], sigma=0.05, age_ms=0.0,
+                    board_timestamp=None, frame="local", nhc=True)
+        old = mock.Mock(**base, expected_yaw_rate=None)
+        ext = mock.Mock(**base, expected_yaw_rate=0.75)
+        old_payload, _, _ = aiding_imu.build_payload(old, 1, 0x1234)
+        ext_payload, _, _ = aiding_imu.build_payload(ext, 1, 0x1234)
+        self.assertEqual(len(old_payload), 17)
+        self.assertEqual(len(ext_payload), 21)
+        self.assertEqual(old_payload[16], 1)
+        self.assertEqual(ext_payload[16], 3)
+        self.assertEqual(struct.unpack(">i", ext_payload[17:21])[0], 750)
+
+    def test_fifo_timestamp_drives_preintegration_dt(self):
+        main = open(MAIN, encoding="utf-8").read()
+        driver = open(IMU_DRIVER, encoding="utf-8").read()
+        self.assertIn("last_fifo_sample_time_us + sample_period_us", driver)
+        self.assertIn("first_sample_time_us + (uint32_t)n * sample_period_us", driver)
+        self.assertIn("raw.sample_time_us-last_sensor_sample_us", main)
+        self.assertIn("sample_dt=(float)dt_us*1.0e-6f", main)
 
     def test_diagnostic_packet_decode(self):
         payload = struct.pack(

@@ -88,7 +88,7 @@
  * delayed/global position belongs on the NUC map->odom estimator (or a future
  * history-buffer estimator), not by inflating sigma on an old MCU sample. */
 #define AID_MAX_AGE_US                      200000UL /* legacy compatibility only */
-#define AID_WHEEL_MAX_AGE_US                 50000UL
+#define AID_WHEEL_MAX_AGE_US                 30000UL
 #define AID_YAW_MAX_AGE_US                   50000UL
 #define AID_WORLD_VEL_MAX_AGE_US             50000UL
 #define AID_WORLD_POS_MAX_AGE_US             40000UL

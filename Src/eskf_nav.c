@@ -713,6 +713,31 @@ static float nis_gate_for_dimension(uint8_t m)
     return ESKF_NIS_GATE_3D;
 }
 
+__attribute__((noinline))
+static void body_velocity_model(const EskfNav *f,float R[3][3],
+                                float pred_body[3],float sv[3][3])
+{
+    eskf_nav_rotation_matrix(f,R);
+    pred_body[0]=pred_body[1]=pred_body[2]=0.0f;
+    for(int axis=0;axis<3;axis++)
+        for(int w=0;w<3;w++)pred_body[axis]+=R[w][axis]*f->velocity[w];
+    skew(pred_body,sv);
+}
+
+int eskf_nav_preview_body_x_nis(const EskfNav *f,float velocity_body_x,float sigma,
+                                float *innovation,float *nis)
+{
+    if(!f||!innovation||!nis||!isfinite(velocity_body_x)||!isfinite(sigma)||
+       sigma<AID_SIGMA_VEL_MIN_MPS||sigma>AID_SIGMA_VEL_MAX_MPS)return 0;
+
+    float R[3][3],pred_body[3],sv[3][3];
+    body_velocity_model(f,R,pred_body,sv);
+    const uint8_t hi[6]={IDX_TH,IDX_TH+1,IDX_TH+2,IDX_V,IDX_V+1,IDX_V+2};
+    const float hv[6]={sv[0][0],sv[0][1],sv[0][2],R[0][0],R[1][0],R[2][0]};
+    *innovation=velocity_body_x-pred_body[0];
+    return scalar_nis_sparse(f,hi,hv,6U,*innovation,sigma*sigma,nis);
+}
+
 int eskf_nav_fuse_body_velocity(EskfNav *f,const float velocity_body[3],uint8_t axis_mask,float sigma)
 {
     if(!f)return 0;
@@ -730,18 +755,9 @@ int eskf_nav_fuse_body_velocity(EskfNav *f,const float velocity_body[3],uint8_t 
         return 0;
     }
 
-    float R[3][3]; eskf_nav_rotation_matrix(f,R);
-    float pred_body[3]={0.0f,0.0f,0.0f};
-    for(int axis=0;axis<3;axis++) for(int w=0;w<3;w++) pred_body[axis]+=R[w][axis]*f->velocity[w];
-    float sv[3][3]; skew(pred_body,sv);
-    if(has_wheel){
-        d->last_wheel_innovation_mps=velocity_body[0]-pred_body[0];
-        const uint8_t hi0[6]={IDX_TH,IDX_TH+1,IDX_TH+2,IDX_V,IDX_V+1,IDX_V+2};
-        const float hv0[6]={sv[0][0],sv[0][1],sv[0][2],R[0][0],R[1][0],R[2][0]};
-        float nis0=NAN;
-        if(scalar_nis_sparse(f,hi0,hv0,6U,d->last_wheel_innovation_mps,sigma*sigma,&nis0))
-            d->last_wheel_nis=nis0;
-    }
+    float R[3][3],pred_body[3],sv[3][3];
+    body_velocity_model(f,R,pred_body,sv);
+    if(has_wheel) d->last_wheel_innovation_mps=velocity_body[0]-pred_body[0];
 
     float H[3][ESKF_NAV_DIM]={{0.0f}};
     float innov[3]={0.0f,0.0f,0.0f};
@@ -754,7 +770,13 @@ int eskf_nav_fuse_body_velocity(EskfNav *f,const float velocity_body[3],uint8_t 
         }
         float residual=velocity_body[axis]-pred_body[axis];
         if(fabsf(residual)>AID_WHEEL_INNOV_MAX_MPS){
-            if(has_wheel){d->last_wheel_reason=ESKF_DIAG_REASON_INNOVATION_LIMIT;d->wheel_reject_count++;}
+            if(has_wheel){
+                float pi=0.0f,pn=NAN;
+                (void)eskf_nav_preview_body_x_nis(f,velocity_body[0],sigma,&pi,&pn);
+                d->last_wheel_nis=pn;
+                d->last_wheel_reason=ESKF_DIAG_REASON_INNOVATION_LIMIT;
+                d->wheel_reject_count++;
+            }
             return 0;
         }
         innov[m]=residual;

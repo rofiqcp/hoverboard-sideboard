@@ -13,12 +13,14 @@
  * - NIS/yaw/lateral terms corroborate wheel residual instead of triggering alone;
  * - EWMA + persistence + hysteresis prevent one-sample escalation.
  */
-#define SLIP_EWMA_TAU_S                 0.35f
+#define SLIP_EWMA_TAU_S                 0.20f
 #define SLIP_NEAR_ZERO_SPEED_MPS        0.15f
 #define SLIP_ZERO_RESIDUAL_DB_MPS       0.18f
-#define SLIP_MOVING_RESIDUAL_DB_MPS     0.28f
-#define SLIP_SPEED_DB_GAIN              0.08f
-#define SLIP_FORWARD_FULL_MPS           1.20f
+#define SLIP_MOVING_RESIDUAL_DB_MPS     0.24f
+/* High-speed guard: do not let the absolute residual deadband grow to >1 m/s.
+ * 0.02 m/s per m/s corresponds to ~2% speed-dependent allowance. */
+#define SLIP_SPEED_DB_GAIN              0.02f
+#define SLIP_FORWARD_FULL_MPS           0.80f
 
 #define SLIP_NIS_DB                     2.0f
 #define SLIP_NIS_FULL                  18.0f
@@ -31,11 +33,11 @@
 #define SLIP_LATERAL_FULL_MPS2          4.00f
 
 #define SLIP_SUSPECT_SCORE              0.32f
-#define SLIP_SUSPECT_HOLD_S             0.35f
+#define SLIP_SUSPECT_HOLD_S             0.15f
 #define SLIP_SLIP_SCORE                 0.58f
-#define SLIP_SLIP_HOLD_S                0.65f
+#define SLIP_SLIP_HOLD_S                0.30f
 #define SLIP_SEVERE_SCORE               0.82f
-#define SLIP_SEVERE_HOLD_S              0.90f
+#define SLIP_SEVERE_HOLD_S              0.45f
 
 #define SLIP_RECOVER_ENTER_SCORE        0.30f
 #define SLIP_RECOVER_ENTER_HOLD_S       1.20f

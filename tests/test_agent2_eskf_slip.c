@@ -63,6 +63,17 @@ static void test_slip_observer(void)
           "near-zero encoder quantization uses wider deadband");
 
     slip_observer_init(&o);
+    feed(&o,3.0f,10.0f,9.7f,1.5f,0.0f,0.0f,0,0.2f);
+    check(slip_observer_get_state(&o)==SLIP_STATE_NORMAL,
+          "3 percent high-speed wheel mismatch remains NORMAL");
+
+    slip_observer_init(&o);
+    feed(&o,1.2f,10.0f,9.0f,25.0f,0.0f,0.0f,0,0.3f);
+    check(slip_observer_get_state(&o)==SLIP_STATE_SLIP ||
+          slip_observer_get_state(&o)==SLIP_STATE_SEVERE,
+          "persistent 10 percent high-speed slip is detected quickly");
+
+    slip_observer_init(&o);
     feed(&o,2.0f,2.0f,2.0f,1.0f,0.0f,0.0f,1,0.0f);
     {
         SlipObserverInput spike={6.0f,2.0f,80.0f,2.0f,0.0f,1U,5.0f,0.02f};
@@ -171,6 +182,16 @@ static void test_eskf_agent2_api(void)
     }
 
     eskf_nav_init(&f,a0);
+    {
+        EskfNav before=f;
+        float innovation=NAN,nis=NAN;
+        check(eskf_nav_preview_body_x_nis(&f,0.5f,0.10f,&innovation,&nis),
+              "current wheel innovation/NIS preview succeeds");
+        check(fabsf(innovation-0.5f)<1e-5f && isfinite(nis) && nis>0.0f,
+              "current wheel preview reports finite innovation/NIS");
+        check(memcmp(&before,&f,sizeof(f))==0,
+              "wheel NIS preview does not mutate ESKF state");
+    }
     {
         float wheel[3]={0.0f,0.0f,0.0f};
         check(eskf_nav_fuse_body_velocity(&f,wheel,0x01U,0.10f),

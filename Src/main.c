@@ -658,6 +658,7 @@ int main(void)
     uint32_t imu_error_streak = 0U;
     uint32_t last_fifo_resync = imu_mpu6xxx_get_fifo_stats()->fifo_resync_count;
     uint32_t last_imu_predict_us = board_micros();
+    uint32_t last_sensor_sample_us = 0U;
 
     /* ZUPT otomatis hanya diizinkan dari keadaan boot diam sampai gerak pertama.
      * Sesudah AGV mulai bergerak, ZUPT hanya dilakukan atas perintah master. */
@@ -690,12 +691,8 @@ int main(void)
     slip_observer_init(&slip_observer);
     float last_effective_wheel_sigma_mps=0.0f;
     uint32_t last_wheel_observer_us=0U;
-    uint32_t last_psd_check_us=0U;
     uint32_t last_imu_config_recovery_us=0U;
-    uint8_t covariance_psd_ok=1U;
     uint8_t diag_stream_divider=0U;
-    EskfNavDiagnostics cached_eskf_diag;
-    memset(&cached_eskf_diag,0,sizeof(cached_eskf_diag));
 
     for (;;) {
         board_watchdog_kick();
@@ -768,7 +765,13 @@ int main(void)
         for (uint8_t n=0U;n<fifo_count;n++) {
             raw=fifo_samples[n];
             imu_apply_static_calibration(&raw,&settings,accel,gyro);
-            imu_preintegrator_push(&preintegrator,gyro,accel,sensor_dt);
+            float sample_dt=sensor_dt;
+            if(last_sensor_sample_us!=0U){
+                uint32_t dt_us=(uint32_t)(raw.sample_time_us-last_sensor_sample_us);
+                if(dt_us>=500U && dt_us<=20000U) sample_dt=(float)dt_us*1.0e-6f;
+            }
+            last_sensor_sample_us=raw.sample_time_us;
+            imu_preintegrator_push(&preintegrator,gyro,accel,sample_dt);
             imu_calibration_update(&calibration,&raw,&settings);
         }
         imu_apply_static_calibration(&raw,&settings,accel,gyro);
@@ -821,25 +824,9 @@ int main(void)
                 gravity_ok = 0U;
         }
 
-        /* Full 15x15 PSD validation is intentionally low-rate. A failure uses
-         * the existing known-good nominal backup and resets covariance only. */
-        if (last_psd_check_us==0U ||
-            (uint32_t)(now_us-last_psd_check_us)>=ESKF_PSD_CHECK_INTERVAL_US) {
-            last_psd_check_us=now_us;
-            covariance_psd_ok=(uint8_t)(eskf_nav_covariance_psd_check(&eskf)?1U:0U);
-            eskf_nav_get_diagnostics(&eskf,&cached_eskf_diag);
-            covariance_psd_ok=(uint8_t)(covariance_psd_ok && cached_eskf_diag.covariance_psd_ok);
-            if (!covariance_psd_ok) {
-                filter_health_reset_count++;
-                if (!nominal_backup_restore(&eskf,&nominal_backup))
-                    init_filter(&eskf,&raw,&settings);
-                imu_preintegrator_init(&preintegrator);
-                (void)imu_mpu6xxx_fifo_reset();
-                last_fifo_resync=imu_mpu6xxx_get_fifo_stats()->fifo_resync_count;
-                startup_zupt=sample_is_still?1U:0U;
-                continue;
-            }
-        }
+        /* Full 15x15 Cholesky PSD validation stays in host regression. Runtime
+         * uses eskf_nav_is_healthy() every prediction cycle: finite/Cauchy gates
+         * plus five 3x3 PSD blocks catch faults with much lower F103 flash/CPU cost. */
 
         zupt_applied = 0U;
         if (startup_zupt && !sample_is_still) {
@@ -1120,25 +1107,25 @@ int main(void)
                             lever_cross[2]=omega[0]*settings.imu_position_body[1]-omega[1]*settings.imu_position_body[0];
                             for(int i=0;i<3;i++)target[i]+=lever_cross[i];
 
-                            float body_velocity[3]={0.0f,0.0f,0.0f};
-                            float previous_nis=eskf.diagnostics.last_wheel_nis;
-                            if(!isfinite(previous_nis)||previous_nis<0.0f)previous_nis=0.0f;
+                            float current_innovation=0.0f,current_nis=0.0f;
+                            int wheel_preview_ok=eskf_nav_preview_body_x_nis(&eskf,target[0],sigma,
+                                                                            &current_innovation,&current_nis);
                             float observer_dt=0.02f;
                             if(last_wheel_observer_us!=0U){
                                 observer_dt=(float)((uint32_t)(now_us-last_wheel_observer_us))*1.0e-6f;
                                 if(observer_dt<=0.0f)observer_dt=0.02f;
                             }
                             last_wheel_observer_us=now_us;
-                            if(eskf_nav_get_body_velocity(&eskf,body_velocity)){
+                            if(wheel_preview_ok){
                                 SlipObserverInput slip_in;
                                 memset(&slip_in,0,sizeof(slip_in));
                                 slip_in.wheel_speed_mps=target[0];
-                                slip_in.predicted_forward_mps=body_velocity[0];
-                                slip_in.wheel_nis=previous_nis;
+                                slip_in.predicted_forward_mps=target[0]-current_innovation;
+                                slip_in.wheel_nis=current_nis;
                                 slip_in.gyro_z_rads=omega[2];
-                                /* Steering angle is not available on this MCU protocol yet.
-                                 * Keep the Ackermann model hook explicit rather than inventing it. */
-                                slip_in.expected_yaw_rate_valid=0U;
+                                slip_in.expected_yaw_rate_rads=req.value[1];
+                                slip_in.expected_yaw_rate_valid=(uint8_t)
+                                    ((req.flags&AID_FLAG_EXPECTED_YAW_RATE)!=0U);
                                 slip_in.lateral_accel_mps2=accel_for_gravity[1];
                                 slip_in.dt_s=observer_dt;
                                 slip_observer_update(&slip_observer,&slip_in);
@@ -1282,7 +1269,7 @@ int main(void)
             diag.max_pending_ticks=bs.imu_max_pending_ticks;
             diag.uart_rx_overflow_count=bs.uart_rx_overflow_count;
             diag.uart_tx_timeout_count=bs.uart_tx_timeout_count;
-            diag.covariance_psd_ok=covariance_psd_ok;
+            diag.covariance_psd_ok=(uint8_t)(eskf_nav_is_healthy(&eskf)?1U:0U);
             diag.aiding_reject_count=aid_status.reject_count;
             diag.filter_health_reset_count=filter_health_reset_count;
             diag.imu_gap_count=eskf.diagnostics.imu_gap_count;

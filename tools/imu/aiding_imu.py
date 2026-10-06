@@ -27,7 +27,10 @@ def build_payload(a,typ,request_id):
     if a.command=="wheel":
         if len(a.values)!=1: raise ValueError("wheel butuh velocity m/s")
         sigma=.05 if a.sigma is None else a.sigma
-        p+=struct.pack(">iHB",round(a.values[0]*1000),round(sigma*1000),1 if a.nhc else 0)
+        flags=(1 if a.nhc else 0) | (2 if a.expected_yaw_rate is not None else 0)
+        p+=struct.pack(">iHB",round(a.values[0]*1000),round(sigma*1000),flags)
+        if a.expected_yaw_rate is not None:
+            p+=struct.pack(">i",round(a.expected_yaw_rate*1000))
     elif a.command in ("world-vel","world-pos"):
         if len(a.values)!=3: raise ValueError(f"{a.command} butuh x y z")
         sigma=(.10 if a.command=="world-vel" else .25) if a.sigma is None else a.sigma
@@ -60,6 +63,7 @@ def main():
     ap.add_argument("--sigma",type=float,default=None)
     tg=ap.add_mutually_exclusive_group(); tg.add_argument("--age-ms",type=float,default=None); tg.add_argument("--board-timestamp",type=int,default=None)
     ap.add_argument("--frame",choices=("local","enu"),default="local"); ap.add_argument("--nhc",action="store_true")
+    ap.add_argument("--expected-yaw-rate",type=float,default=None,help="wheel only: expected yaw rate rad/s from steering/Ackermann")
     ap.add_argument("--port",default="auto"); ap.add_argument("--baud",type=int,default=BAUD); ap.add_argument("--retries",type=int,default=4); ap.add_argument("--overall-timeout",type=float,default=15.0)
     a=ap.parse_args(); typ=TYPES[a.command]
     request_id=(time.monotonic_ns() ^ (time.time_ns()>>16)) & 0xffff
