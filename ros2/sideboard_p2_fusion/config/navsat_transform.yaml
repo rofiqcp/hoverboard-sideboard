@@ -1,0 +1,16 @@
+navsat_transform:
+  ros__parameters:
+    frequency: 30.0
+    delay: 0.0
+    magnetic_declination_radians: 0.0
+    yaw_offset: 0.0
+    zero_altitude: true
+    broadcast_utm_transform: false
+    broadcast_utm_transform_as_parent_frame: false
+    publish_filtered_gps: true
+
+    # Safe default: global GNSS anchoring requires a world-referenced ENU
+    # heading source. Keep this false unless the odom/map yaw has explicitly
+    # been aligned to ENU. With false, navsat_transform uses the remapped IMU.
+    use_odometry_yaw: false
+    wait_for_datum: false

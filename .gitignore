@@ -23,3 +23,11 @@ tools/logs/*.csv
 tools/logs/run/*.csv
 !tools/logs/.gitkeep
 !tools/logs/run/.gitkeep
+
+# ROS2 local build products
+ros2/build/
+ros2/install/
+ros2/log/
+
+# Pytest cache
+.pytest_cache/

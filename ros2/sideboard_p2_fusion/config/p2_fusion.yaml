@@ -1,0 +1,87 @@
+sideboard_p2_fusion:
+  ros__parameters:
+    wheel_odom_topic: /wheel/odometry_raw
+    steering_topic: /steering/angle_rad
+    lio_odom_topic: /Odometry
+    lio_canonical_topic: /p2/lio/odometry
+    lio_output_frame: odom
+    lio_body_to_base_x_m: 0.0
+    lio_body_to_base_y_m: 0.0
+    lio_body_to_base_yaw_rad: 0.0
+    lio_position_sigma_floor_m: 0.03
+    lio_yaw_sigma_floor_rad: 0.02
+    external_slip_ratio_topic: /sideboard/slip_ratio
+    output_wheel_odom_topic: /p2/wheel/odometry
+    diagnostics_topic: /p2/diagnostics
+    base_frame: base_link
+    wheel_frame: base_link
+
+    steering_timeout_s: 0.25
+    steering_input_scale: 1.0
+    lio_velocity_filter_tau_s: 0.08
+    lio_yaw_rate_filter_tau_s: 0.08
+    lio_max_abs_speed_mps: 35.0
+    lio_max_abs_yaw_rate_rads: 5.0
+    wheel_input_abs_max_mps: 30.0
+    steering_input_abs_max_rad: 1.2
+
+    calibration_file: ~/.config/hoverboard_sideboard/p2_calibration.yaml
+    calibration_save_interval_s: 3.0
+
+    wheel_scale_initial: 1.0
+    wheel_scale_min: 0.75
+    wheel_scale_max: 1.25
+    wheel_scale_forgetting: 0.999
+    wheel_scale_cov_initial: 25.0
+
+    wheelbase_initial_m: 1.0
+    wheelbase_min_m: 0.35
+    wheelbase_max_m: 4.0
+    steering_zero_initial_rad: 0.0
+    steering_zero_limit_rad: 0.25
+    steering_offset_learning_rate: 0.0015
+    wheelbase_learning_rate: 0.006
+
+    reference_timeout_s: 0.20
+    scale_min_speed_mps: 0.60
+    scale_max_yaw_rate_rads: 0.35
+    geometry_min_speed_mps: 0.80
+    geometry_min_steer_rad: 0.035
+    geometry_max_steer_rad: 0.70
+    calibration_slip_probability_max: 0.35
+    calibration_accel_abs_max_mps2: 3.5
+    scale_calibration_ratio_max: 0.12
+    geometry_speed_ratio_max: 0.08
+
+    speed_ratio_deadband: 0.035
+    speed_ratio_full: 0.20
+    accel_mismatch_deadband_mps2: 0.75
+    accel_mismatch_full_mps2: 4.0
+    yaw_mismatch_deadband_rads: 0.08
+    yaw_mismatch_full_rads: 0.65
+    external_slip_ratio_full: 0.20
+    slip_probability_tau_s: 0.20
+
+    dob_bandwidth_hz: 3.0
+    dob_max_slip_velocity_mps: 8.0
+    wheel_sigma_base_mps: 0.05
+    wheel_sigma_max_mps: 5.0
+    wheel_sigma_slip_gain: 25.0
+    wheel_sigma_dob_gain: 0.40
+    severe_slip_probability: 0.92
+
+    derivative_min_dt_s: 0.005
+    derivative_max_dt_s: 0.25
+    nhc_sigma_base_mps: 0.08
+    yaw_rate_sigma_base_rads: 0.08
+
+sideboard_serial_aiding_bridge:
+  ros__parameters:
+    input_topic: /p2/wheel/odometry
+    port: auto
+    baud: 921600
+    nhc: true
+    max_age_us: 14000
+    reconnect_interval_s: 0.5
+    diagnostics_topic: /p2/serial_bridge_diagnostics
+    steering_valid_topic: /p2/steering_valid
