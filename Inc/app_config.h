@@ -24,12 +24,28 @@
 #define TELEMETRY_RATE_HZ            50UL
 #define TELEMETRY_DIVIDER           (IMU_LOOP_RATE_HZ / TELEMETRY_RATE_HZ)
 
-/* Konfigurasi MPU6xxx. Sensor internal 200 Hz masuk FIFO, ESKF tetap 100 Hz.
- * HAL STM32 memakai alamat I2C 8-bit. */
+/* Konfigurasi MPU6xxx. ESKF tetap 100 Hz; seluruh sampel sensor masuk FIFO
+ * dan dipreintegrasikan. Profile high-speed memperbesar bandwidth/range agar
+ * hard acceleration, skid, dan yaw-rate tinggi tidak mudah clip/alias.
+ * MPU60xx/65xx dengan DLPF aktif memakai gyro output 1 kHz, sehingga divider
+ * 1 menghasilkan 500 Hz. HAL STM32 memakai alamat I2C 8-bit. */
 #define MPU6XXX_I2C_ADDR            (0x68U << 1)
+#define MPU6XXX_HIGHSPEED_PROFILE       1U
+#if MPU6XXX_HIGHSPEED_PROFILE
+#define MPU6XXX_SAMPLE_HZ           500UL
+#define MPU6XXX_ACCEL_LSB_PER_G      4096.0f  /* +/-8 g */
+#define MPU6XXX_GYRO_LSB_PER_DPS       32.8f  /* +/-1000 deg/s */
+#define MPU6XXX_DLPF_CFG                2U    /* ~92-98 Hz class bandwidth */
+#define MPU6XXX_GYRO_CONFIG_VALUE    0x10U
+#define MPU6XXX_ACCEL_CONFIG_VALUE   0x10U
+#else
 #define MPU6XXX_SAMPLE_HZ           200UL
-#define MPU6XXX_ACCEL_LSB_PER_G      8192.0f
-#define MPU6XXX_GYRO_LSB_PER_DPS       65.5f
+#define MPU6XXX_ACCEL_LSB_PER_G      8192.0f  /* +/-4 g */
+#define MPU6XXX_GYRO_LSB_PER_DPS       65.5f  /* +/-500 deg/s */
+#define MPU6XXX_DLPF_CFG                3U    /* ~42-44 Hz class bandwidth */
+#define MPU6XXX_GYRO_CONFIG_VALUE    0x08U
+#define MPU6XXX_ACCEL_CONFIG_VALUE   0x08U
+#endif
 #define IMU_REINIT_ERROR_COUNT          20U
 #define GRAVITY_MPS2                   9.80665f
 
@@ -88,7 +104,10 @@
  * delayed/global position belongs on the NUC map->odom estimator (or a future
  * history-buffer estimator), not by inflating sigma on an old MCU sample. */
 #define AID_MAX_AGE_US                      200000UL /* legacy compatibility only */
-#define AID_WHEEL_MAX_AGE_US                 30000UL
+#define AID_WHEEL_MAX_AGE_US                 15000UL
+#define AID_WHEEL_HISTORY_SAMPLES                 3U
+#define AID_WHEEL_COMP_MIN_AGE_US              2000UL
+#define AID_WHEEL_HISTORY_MAX_GAP_US          25000UL
 #define AID_YAW_MAX_AGE_US                   50000UL
 #define AID_WORLD_VEL_MAX_AGE_US             50000UL
 #define AID_WORLD_POS_MAX_AGE_US             40000UL

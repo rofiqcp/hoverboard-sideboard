@@ -21,6 +21,9 @@
  * 0.02 m/s per m/s corresponds to ~2% speed-dependent allowance. */
 #define SLIP_SPEED_DB_GAIN              0.02f
 #define SLIP_FORWARD_FULL_MPS           0.80f
+#define SLIP_RATIO_MIN_SPEED_MPS        0.50f
+#define SLIP_RATIO_DB                   0.04f
+#define SLIP_RATIO_FULL                 0.18f
 
 #define SLIP_NIS_DB                     2.0f
 #define SLIP_NIS_FULL                  18.0f
@@ -100,6 +103,14 @@ void slip_observer_update(SlipObserver *o, const SlipObserverInput *in)
 
     const float forward_evidence =
         clamp01((forward_residual - residual_db) / SLIP_FORWARD_FULL_MPS);
+    float signed_slip_ratio = 0.0f;
+    float ratio_evidence = 0.0f;
+    if (speed_ref >= SLIP_RATIO_MIN_SPEED_MPS) {
+        signed_slip_ratio =
+            (in->wheel_speed_mps - in->predicted_forward_mps) / speed_ref;
+        ratio_evidence = clamp01((fabsf(signed_slip_ratio) - SLIP_RATIO_DB) /
+                                 (SLIP_RATIO_FULL - SLIP_RATIO_DB));
+    }
     const float nis_evidence =
         clamp01((in->wheel_nis - SLIP_NIS_DB) / (SLIP_NIS_FULL - SLIP_NIS_DB));
 
@@ -118,6 +129,8 @@ void slip_observer_update(SlipObserver *o, const SlipObserverInput *in)
 
     o->forward_residual_ewma_mps =
         ewma(o->forward_residual_ewma_mps, forward_residual, dt);
+    o->slip_ratio_ewma =
+        ewma(o->slip_ratio_ewma, signed_slip_ratio, dt);
     o->wheel_nis_ewma = ewma(o->wheel_nis_ewma, in->wheel_nis, dt);
     o->yaw_residual_ewma_rads =
         ewma(o->yaw_residual_ewma_rads, yaw_residual, dt);
@@ -130,8 +143,9 @@ void slip_observer_update(SlipObserver *o, const SlipObserverInput *in)
      * Yaw mismatch is useful during turning, while lateral acceleration only
      * amplifies an already inconsistent wheel/yaw condition.
      */
-    float raw_score = 0.58f * forward_evidence +
-                      0.27f * nis_evidence +
+    float raw_score = 0.42f * forward_evidence +
+                      0.20f * ratio_evidence +
+                      0.23f * nis_evidence +
                       0.15f * yaw_evidence;
     raw_score += 0.18f * lateral_evidence *
                  fmaxf(forward_evidence, yaw_evidence);
@@ -226,6 +240,11 @@ SlipState slip_observer_get_state(const SlipObserver *o)
 float slip_observer_get_score(const SlipObserver *o)
 {
     return o ? o->score : 0.0f;
+}
+
+float slip_observer_get_slip_ratio(const SlipObserver *o)
+{
+    return o ? o->slip_ratio_ewma : 0.0f;
 }
 
 float slip_observer_wheel_sigma_scale(const SlipObserver *o)

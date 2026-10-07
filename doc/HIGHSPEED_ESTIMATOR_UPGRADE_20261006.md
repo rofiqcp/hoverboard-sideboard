@@ -15,7 +15,7 @@ Memory map tetap:
 - manifest: 0x0800F800
 - settings B: 0x0800FC00
 
-Final checked APP image: 55388 bytes; app region 56320 bytes; headroom sekitar 932 bytes.
+Final checked APP image setelah P1: 56012 bytes; app region 56320 bytes; headroom sekitar 308 bytes.
 
 ### 2. Current-measurement wheel NIS
 Slip observer tidak lagi memakai NIS measurement sebelumnya.
@@ -38,6 +38,8 @@ Slip observer dituning agar deadband tidak tumbuh terlalu besar terhadap kecepat
 Regression tambahan:
 - 3% mismatch pada 10 m/s tetap NORMAL.
 - 10% mismatch persisten pada 10 m/s terdeteksi sebagai SLIP/SEVERE.
+- slip ratio eksplisit bertanda sekarang dihitung sebagai `(wheel-predicted)/max(|wheel|,|predicted|)` di atas 0.5 m/s.
+- +10% wheel spin konvergen sekitar +0.10; braking/skid menghasilkan ratio negatif.
 
 ### 4. Expected yaw-rate untuk Ackermann slip detection
 Wheel aiding v2 sekarang dapat membawa optional expected yaw-rate.
@@ -62,9 +64,14 @@ Fallback ke nominal observed sample dt hanya bila interval timestamp tidak masuk
 
 Ini memisahkan physical IMU sample interval dari jitter scheduler/service MCU.
 
-### 6. Wheel aiding freshness diperketat
-`AID_WHEEL_MAX_AGE_US` diubah 50 ms -> 30 ms.
-Local MCU belum memiliki history rewind/replay, sehingga wheel measurement lama tidak boleh terlalu jauh dari state saat fusion.
+### 6. Wheel aiding freshness + short delayed-wheel compensation
+`AID_WHEEL_MAX_AGE_US` sekarang 15 ms.
+
+F103 tidak menyimpan full history covariance 15x15 karena boros RAM. Sebagai gantinya MCU menyimpan 3 titik recent predicted body-X velocity (~0/10/20 ms pada estimator 100 Hz). Untuk wheel packet berumur >=2 ms, predicted body-X di epoch measurement diinterpolasi dan wheel measurement ditranslasikan ke current epoch:
+
+`z_now = z_old + (h_now - h_old)`
+
+sehingga innovation pendek dipertahankan secara aproksimasi tanpa rewind covariance penuh. Full delayed global fusion tetap menjadi tanggung jawab NUC.
 
 ### 7. Runtime covariance health vs host full PSD
 Full 15x15 Cholesky PSD check tetap tersedia dan tetap diuji pada host regression.
@@ -80,14 +87,14 @@ Ini mengurangi flash/CPU F103 tetapi mempertahankan fault detection runtime.
 - host ESKF/preintegration math suite
 - Agent 1 IMU runtime-health suite
 - Agent 2 ESKF/slip suite
-- Python integration/serial/autosave: 27 passed
+- Python integration/serial/autosave: 29 passed
 - APP_STLINK build: PASS
 - APP_USART build: PASS
 - BOOTLOADER_STLINK build: PASS
 
 Build final:
 - APP RAM: 2068 / 20480 bytes
-- APP flash image: 55388 bytes
+- APP flash image: 56012 bytes (region aplikasi 56320 bytes; headroom 308 bytes)
 - bootloader flash: 2624 bytes
 
 ## Yang belum boleh diklaim sebelum test hardware
@@ -100,17 +107,25 @@ Wajib lakukan:
 5. wheel-spin/skid terkontrol pada area aman;
 6. log wheel innovation/NIS, slip score/state, accel/gyro clipping, FIFO resync, scheduler miss;
 7. bandingkan odometry terhadap Livox/GNSS/ground truth;
-8. ukur latency wheel measurement aktual sebelum menurunkan freshness di bawah 30 ms.
+8. ukur latency wheel measurement aktual; packet di atas 15 ms sekarang ditolak MCU.
 
-## IMU dynamic range
-Production profile masih 200 Hz, +/-4 g, +/-500 deg/s, DLPF cfg 3.
-Jangan menaikkan range/filter secara buta. Gunakan telemetry:
-- accel_clip_count
-- gyro_clip_count
-- fifo_resync_count
-- scheduler_miss_count
+## IMU dynamic range — P1 high-speed profile
+Production profile P1 sekarang:
+- FIFO sensor: 500 Hz
+- accel: +/-8 g (`4096 LSB/g`)
+- gyro: +/-1000 deg/s (`32.8 LSB/(deg/s)`)
+- DLPF cfg 2, bandwidth kelas ~92–98 Hz
+- estimator/preintegration output cadence tetap 100 Hz
+- I2C1 tetap 400 kHz
 
-Jika clipping nyata muncul, benchmark profile 500 Hz dengan +/-8 g dan +/-1000 deg/s serta bandwidth yang lebih tinggi.
+Register FS/DLPF dan sample divider diverifikasi runtime. Timestamp validity mengikuti nominal sample-rate, bukan lagi hard-coded 100–300 Hz.
+
+Host benchmark 120 s:
+- 200->100 Hz: velocity error ~6.60e-05 m/s; position error ~0.00119 m
+- 500->100 Hz: velocity error ~3.74e-05 m/s; position error ~0.00190 m
+- coning error ~0.0432 deg
+
+Tetap monitor `accel_clip_count`, `gyro_clip_count`, `fifo_resync_count`, dan scheduler miss pada kendaraan nyata sebelum menyimpulkan profile ini optimal terhadap vibrasi chassis.
 
 ## Referensi upgrade tahap berikut
 - UMich-CURLY/slip_detection_DOB — IMU + wheel encoder, slip/DOB concept
@@ -134,3 +149,19 @@ NUC:
 Livox Mid360 LIO + wheel + steering + sideboard IMU/odom + GNSS/RTK when available.
 
 Untuk posisi jangka panjang, LiDAR/GNSS/vision/UWB harus menjadi external anchor. IMU + satu wheel forward velocity tidak cukup untuk membuat posisi absolut bounded selamanya.
+
+
+## P1 status — 2026-10-07
+Software P1 yang sudah diterapkan:
+- explicit signed slip ratio + ratio evidence;
+- current wheel NIS sebelum fusion;
+- optional expected yaw-rate;
+- per-sample FIFO timestamp menjadi dt preintegration;
+- high-speed MPU6xxx profile 500 Hz / +/-8 g / +/-1000 deg/s / DLPF2;
+- 15 ms wheel freshness;
+- 3-point short delayed-wheel compensation;
+- timestamp/history reset pada IMU reinit/FIFO resync;
+- host benchmark 500->100 Hz;
+- full APP_STLINK / APP_USART / bootloader build gate.
+
+Hardware dynamic validation belum dilakukan pada 2026-10-07 karena mesin RDC tidak melihat sideboard USB serial maupun ST-Link (`/dev/ttyUSB*`, `/dev/ttyACM*`, dan ST-Link tidak terdeteksi). Karena itu performa vibrasi, clipping, FIFO margin, dan slip detection kendaraan nyata belum boleh diklaim tervalidasi.

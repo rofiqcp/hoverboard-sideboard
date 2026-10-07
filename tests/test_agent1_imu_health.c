@@ -2,6 +2,7 @@
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
+#include "app_config.h"
 #include "imu_mpu6xxx.h"
 #include "board.h"
 
@@ -110,6 +111,7 @@ int main(void)
     assert(health->init_count == 1U && health->reinit_count == 0U && health->config_ok == 1U);
     assert(imu_mpu6xxx_get_info()->whoami == 0x68U);
     assert(imu_mpu6xxx_get_info()->fifo_packet_bytes == 12U);
+    assert(imu_mpu6xxx_get_info()->sample_hz == MPU6XXX_SAMPLE_HZ);
 
     read_one(32767, 0, 0, 0, 0, 0);
     assert(health->accel_clip_count[0] == 1U && health->last_accel_clip_mask == 0x01U);
@@ -142,7 +144,7 @@ int main(void)
     assert(imu_mpu6xxx_periodic_verify(t) == 0);
     assert(health->config_ok == 0U && health->config_mismatch_count == mismatches + 1U);
 
-    regs[REG_GYRO_CONFIG] = 0x08U;
+    regs[REG_GYRO_CONFIG] = MPU6XXX_GYRO_CONFIG_VALUE;
     uint32_t reads_before = read_transactions;
     assert(imu_mpu6xxx_periodic_verify(t + 100000U) == 0);
     assert(read_transactions == reads_before);

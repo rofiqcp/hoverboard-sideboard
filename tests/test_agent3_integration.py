@@ -30,13 +30,26 @@ def boot_info(version=4, start=0x08001800, end=0x0800F400, page=1024, chunk=128,
 class Agent3IntegrationTests(unittest.TestCase):
     def test_source_specific_freshness_limits(self):
         cfg = open(CONFIG, encoding="utf-8").read()
-        self.assertIn("#define AID_WHEEL_MAX_AGE_US                 30000UL", cfg)
+        self.assertIn("#define AID_WHEEL_MAX_AGE_US                 15000UL", cfg)
         self.assertIn("#define AID_YAW_MAX_AGE_US                   50000UL", cfg)
         self.assertIn("#define AID_WORLD_VEL_MAX_AGE_US             50000UL", cfg)
         self.assertIn("#define AID_WORLD_POS_MAX_AGE_US             40000UL", cfg)
         main = open(MAIN, encoding="utf-8").read()
         self.assertIn("aid_source_max_age_us(req.type)", main)
         self.assertNotIn("age>AID_MAX_AGE_US", main)
+
+
+    def test_highspeed_imu_profile_is_explicit_and_verified(self):
+        cfg = open(CONFIG, encoding="utf-8").read()
+        driver = open(IMU_DRIVER, encoding="utf-8").read()
+        self.assertIn("#define MPU6XXX_HIGHSPEED_PROFILE       1U", cfg)
+        self.assertIn("#define MPU6XXX_SAMPLE_HZ           500UL", cfg)
+        self.assertIn("#define MPU6XXX_ACCEL_LSB_PER_G      4096.0f", cfg)
+        self.assertIn("#define MPU6XXX_GYRO_LSB_PER_DPS       32.8f", cfg)
+        self.assertIn("#define MPU6XXX_DLPF_CFG                2U", cfg)
+        self.assertIn("MPU6XXX_GYRO_CONFIG_VALUE", driver)
+        self.assertIn("MPU6XXX_ACCEL_CONFIG_VALUE", driver)
+        self.assertIn("nominal_hz*0.80f", driver)
 
     def test_stationary_startup_initializes_eskf_from_averaged_imu(self):
         main = open(MAIN, encoding="utf-8").read()
@@ -52,6 +65,21 @@ class Agent3IntegrationTests(unittest.TestCase):
         self.assertIn("position_acquisition_offer", main)
         self.assertIn("yaw_acquisition_offer", main)
         self.assertIn("status=7U", main)
+
+    def test_short_delayed_wheel_history_compensation_is_present(self):
+        cfg = open(CONFIG, encoding="utf-8").read()
+        main = open(MAIN, encoding="utf-8").read()
+        self.assertIn("#define AID_WHEEL_HISTORY_SAMPLES                 3U", cfg)
+        self.assertIn("#define AID_WHEEL_COMP_MIN_AGE_US              2000UL", cfg)
+        self.assertIn("wheel_history_lookup(&wheel_history,now_us,age,&old_vx)", main)
+        self.assertIn("target[0]+=current_body[0]-old_vx", main)
+        self.assertIn("wheel_history_reset(&wheel_history)", main)
+        self.assertIn("last_sensor_sample_us=0U", main)
+
+        # z_now = z_old + (h_now-h_old) preserves the old measurement residual.
+        z_old, h_old, h_now = 9.4, 9.1, 9.8
+        z_now = z_old + (h_now - h_old)
+        self.assertAlmostEqual(z_now - h_now, z_old - h_old)
 
     def test_slip_observer_is_integrated_not_reimplemented(self):
         main = open(MAIN, encoding="utf-8").read()

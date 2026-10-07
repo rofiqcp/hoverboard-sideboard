@@ -144,18 +144,18 @@ static int verify_config_once(uint8_t expected_who, uint8_t divider)
     if (!read_reg(REG_SMPLRT_DIV, &v)) return -1;
     if (v != divider) return 0;
     if (!read_reg(REG_CONFIG, &v)) return -1;
-    if ((v & 0x07U) != 0x03U) return 0;
+    if ((v & 0x07U) != MPU6XXX_DLPF_CFG) return 0;
     if (!read_reg(REG_GYRO_CONFIG, &v)) return -1;
-    if ((v & 0x18U) != 0x08U) return 0;
+    if ((v & 0x18U) != (MPU6XXX_GYRO_CONFIG_VALUE & 0x18U)) return 0;
     if (!read_reg(REG_ACCEL_CONFIG, &v)) return -1;
-    if ((v & 0x18U) != 0x08U) return 0;
+    if ((v & 0x18U) != (MPU6XXX_ACCEL_CONFIG_VALUE & 0x18U)) return 0;
     if (!read_reg(REG_FIFO_EN, &v)) return -1;
     if ((v & FIFO_ENABLE_AG) != FIFO_ENABLE_AG) return 0;
     if (!read_reg(REG_USER_CTRL, &v)) return -1;
     if ((v & USER_FIFO_ENABLE) == 0U) return 0;
     if (info.accel_config2_supported) {
         if (!read_reg(REG_ACCEL_CONFIG2, &v)) return -1;
-        if ((v & 0x07U) != 0x03U) return 0;
+        if ((v & 0x07U) != MPU6XXX_DLPF_CFG) return 0;
     }
     return 1;
 }
@@ -231,14 +231,15 @@ int imu_mpu6xxx_init(void)
     if (!write_reg(REG_PWR_MGMT_2, 0x00U)) return 0;
     const uint8_t divider = (uint8_t)(1000U / MPU6XXX_SAMPLE_HZ - 1U);
     if (!write_reg(REG_SMPLRT_DIV, divider)) return 0;
-    if (!write_reg(REG_CONFIG, 0x03U)) return 0;
-    if (!write_reg(REG_GYRO_CONFIG, 0x08U)) return 0;
-    if (!write_reg(REG_ACCEL_CONFIG, 0x08U)) return 0;
+    if (!write_reg(REG_CONFIG, MPU6XXX_DLPF_CFG)) return 0;
+    if (!write_reg(REG_GYRO_CONFIG, MPU6XXX_GYRO_CONFIG_VALUE)) return 0;
+    if (!write_reg(REG_ACCEL_CONFIG, MPU6XXX_ACCEL_CONFIG_VALUE)) return 0;
 
     if (info.device_class == IMU_CLASS_MPU65XX_COMPAT) {
         uint8_t probe = 0U;
-        if (write_reg(REG_ACCEL_CONFIG2, 0x03U) &&
-            read_reg(REG_ACCEL_CONFIG2, &probe) && (probe & 0x07U) == 0x03U) {
+        if (write_reg(REG_ACCEL_CONFIG2, MPU6XXX_DLPF_CFG) &&
+            read_reg(REG_ACCEL_CONFIG2, &probe) &&
+            (probe & 0x07U) == MPU6XXX_DLPF_CFG) {
             info.accel_config2_supported = 1U;
         } else {
             /* WHO_AM_I clone/varian tidak cukup untuk menentukan register map.
@@ -359,8 +360,9 @@ int imu_mpu6xxx_read_fifo(ImuSample *samples, uint8_t max_samples, uint8_t *out_
     }
 
     float timestamp_hz = fifo_stats.observed_sample_hz;
-    if (!(timestamp_hz > 100.0f && timestamp_hz < 300.0f)) {
-        timestamp_hz = (float)info.sample_hz;
+    float nominal_hz=(float)info.sample_hz;
+    if (!(timestamp_hz > nominal_hz*0.80f && timestamp_hz < nominal_hz*1.20f)) {
+        timestamp_hz = nominal_hz;
     }
     uint32_t sample_period_us = (uint32_t)(1000000.0f / timestamp_hz + 0.5f);
     uint32_t first_sample_time_us = have_fifo_sample_time ?

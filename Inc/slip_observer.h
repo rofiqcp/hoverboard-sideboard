@@ -26,6 +26,7 @@ typedef struct {
     SlipState state;
     float score;
     float forward_residual_ewma_mps;
+    float slip_ratio_ewma;
     float yaw_residual_ewma_rads;
     float wheel_nis_ewma;
     float lateral_evidence;
@@ -42,6 +43,7 @@ void slip_observer_init(SlipObserver *observer);
 void slip_observer_update(SlipObserver *observer, const SlipObserverInput *input);
 SlipState slip_observer_get_state(const SlipObserver *observer);
 float slip_observer_get_score(const SlipObserver *observer);
+float slip_observer_get_slip_ratio(const SlipObserver *observer);
 float slip_observer_wheel_sigma_scale(const SlipObserver *observer);
 float slip_observer_nhc_sigma_scale(const SlipObserver *observer);
 int slip_observer_reject_wheel(const SlipObserver *observer);

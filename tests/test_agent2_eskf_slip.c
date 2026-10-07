@@ -72,6 +72,14 @@ static void test_slip_observer(void)
     check(slip_observer_get_state(&o)==SLIP_STATE_SLIP ||
           slip_observer_get_state(&o)==SLIP_STATE_SEVERE,
           "persistent 10 percent high-speed slip is detected quickly");
+    check(slip_observer_get_slip_ratio(&o)>0.08f &&
+          slip_observer_get_slip_ratio(&o)<0.12f,
+          "explicit slip ratio converges near +10 percent wheel spin");
+
+    slip_observer_init(&o);
+    feed(&o,1.5f,0.2f,3.0f,22.0f,0.0f,0.0f,0,0.4f);
+    check(slip_observer_get_slip_ratio(&o)<-0.80f,
+          "explicit signed slip ratio distinguishes braking/skid");
 
     slip_observer_init(&o);
     feed(&o,2.0f,2.0f,2.0f,1.0f,0.0f,0.0f,1,0.0f);

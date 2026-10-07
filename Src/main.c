@@ -56,6 +56,54 @@ typedef struct {
     float anchor_yaw;
 } YawAcquisition;
 
+typedef struct {
+    uint32_t time_us;
+    float body_vx_mps;
+} WheelHistorySample;
+
+typedef struct {
+    /* newest first; 3 points cover ~0/10/20 ms at the 100 Hz estimator */
+    WheelHistorySample sample[AID_WHEEL_HISTORY_SAMPLES];
+    uint8_t count;
+} WheelHistory;
+
+static void wheel_history_reset(WheelHistory *h)
+{
+    if (h) memset(h, 0, sizeof(*h));
+}
+
+static void wheel_history_push(WheelHistory *h, uint32_t time_us,
+                               float body_vx_mps)
+{
+    if (!h) return;
+    if(h->count>1U) h->sample[2]=h->sample[1];
+    if(h->count>0U) h->sample[1]=h->sample[0];
+    h->sample[0].time_us=time_us;
+    h->sample[0].body_vx_mps=body_vx_mps;
+    if(h->count<AID_WHEEL_HISTORY_SAMPLES) h->count++;
+}
+
+/* Short delayed-wheel compensation. Three 100 Hz history points are enough
+ * to interpolate every accepted wheel age (<=15 ms) without covariance replay. */
+static int wheel_history_lookup(const WheelHistory *h, uint32_t now_us,
+                                uint32_t target_age_us, float *body_vx_mps)
+{
+    if (!h || h->count<2U) return 0;
+    for(uint8_t i=0U;i+1U<h->count;i++){
+        const WheelHistorySample *a=&h->sample[i],*b=&h->sample[i+1U];
+        uint32_t aa=(uint32_t)(now_us-a->time_us);
+        uint32_t ab=(uint32_t)(now_us-b->time_us);
+        if(target_age_us>=aa && target_age_us<=ab){
+            uint32_t gap=ab-aa;
+            if(gap==0U || gap>AID_WHEEL_HISTORY_MAX_GAP_US) return 0;
+            float t=(float)(target_age_us-aa)/(float)gap;
+            *body_vx_mps=a->body_vx_mps+t*(b->body_vx_mps-a->body_vx_mps);
+            return 1;
+        }
+    }
+    return 0;
+}
+
 static float wrap_pi(float a)
 {
     while (a > 3.14159265358979323846f) a -= 6.28318530717958647692f;
@@ -689,6 +737,8 @@ int main(void)
     YawAcquisition yaw_acquisition={0};
     SlipObserver slip_observer;
     slip_observer_init(&slip_observer);
+    WheelHistory wheel_history;
+    wheel_history_reset(&wheel_history);
     float last_effective_wheel_sigma_mps=0.0f;
     uint32_t last_wheel_observer_us=0U;
     uint32_t last_imu_config_recovery_us=0U;
@@ -715,6 +765,8 @@ int main(void)
                 if (imu_mpu6xxx_init()) {
                     account_imu_gap(&eskf,now_us,&last_imu_predict_us);
                     imu_preintegrator_init(&preintegrator);
+                    last_sensor_sample_us=0U;
+                    wheel_history_reset(&wheel_history);
                     last_fifo_resync=imu_mpu6xxx_get_fifo_stats()->fifo_resync_count;
                 }
             }
@@ -730,6 +782,8 @@ int main(void)
                 if (imu_mpu6xxx_init()) {
                     account_imu_gap(&eskf,now_us,&last_imu_predict_us);
                     imu_preintegrator_init(&preintegrator);
+                    last_sensor_sample_us=0U;
+                    wheel_history_reset(&wheel_history);
                     last_fifo_resync = imu_mpu6xxx_get_fifo_stats()->fifo_resync_count;
                 }
                 imu_error_streak = 0U;
@@ -746,6 +800,8 @@ int main(void)
              * harus mengakui uncertainty dari inertial input yang tidak teramati. */
             account_imu_gap(&eskf,now_us,&last_imu_predict_us);
             imu_preintegrator_init(&preintegrator);
+            last_sensor_sample_us=0U;
+            wheel_history_reset(&wheel_history);
             last_fifo_resync = fifo_stats->fifo_resync_count;
         }
         if (fifo_count == 0U) {
@@ -756,7 +812,9 @@ int main(void)
         float accel[3] = {0.0f, 0.0f, 0.0f};
         float gyro[3] = {0.0f, 0.0f, 0.0f};
         float sensor_hz=fifo_stats->observed_sample_hz;
-        if (!(sensor_hz>100.0f && sensor_hz<300.0f)) sensor_hz=(float)MPU6XXX_SAMPLE_HZ;
+        const float nominal_sensor_hz=(float)MPU6XXX_SAMPLE_HZ;
+        if (!(sensor_hz>nominal_sensor_hz*0.80f &&
+              sensor_hz<nominal_sensor_hz*1.20f)) sensor_hz=nominal_sensor_hz;
         const float sensor_dt=1.0f/sensor_hz;
 
         /* Sama seperti backend INS production: semua sampel FIFO dipakai untuk
@@ -798,6 +856,12 @@ int main(void)
         for(int i=0;i<3;i++){
             accel_for_gravity[i]=delta.delta_velocity[i]*inv_delta_dt;
             gyro_for_still[i]=delta.delta_angle[i]*inv_delta_dt;
+        }
+        {
+            float body_v[3];
+            if(eskf_nav_get_body_velocity(&eskf,body_v)){
+                wheel_history_push(&wheel_history,now_us,body_v[0]);
+            }
         }
 
         int sample_is_still = stillness_update(&stillness, accel_for_gravity, gyro_for_still, &eskf);
@@ -948,6 +1012,8 @@ int main(void)
                     memset(&pos_acquisition,0,sizeof(pos_acquisition));
                     memset(&yaw_acquisition,0,sizeof(yaw_acquisition));
                     slip_observer_init(&slip_observer);
+                    wheel_history_reset(&wheel_history);
+                    last_sensor_sample_us=0U;
                     last_wheel_observer_us=0U; last_effective_wheel_sigma_mps=0.0f;
                     memset(aid_req_valid,0,sizeof(aid_req_valid));
                     zero_rate_sigma = zero_rate_sigma_from_settings(&settings);
@@ -1064,6 +1130,8 @@ int main(void)
                     memset(&pos_acquisition,0,sizeof(pos_acquisition));
                     memset(&yaw_acquisition,0,sizeof(yaw_acquisition));
                     slip_observer_init(&slip_observer);
+                    wheel_history_reset(&wheel_history);
+                    last_sensor_sample_us=0U;
                     last_wheel_observer_us=0U; last_effective_wheel_sigma_mps=0.0f;
                     memset(aid_req_valid,0,sizeof(aid_req_valid));
                     imu_preintegrator_init(&preintegrator); (void)imu_mpu6xxx_fifo_reset();
@@ -1096,12 +1164,23 @@ int main(void)
                 } else{
                     float sigma=req.sigma*(1.0f+(float)age/(float)max_age);
                     if(req.type==AID_CMD_WHEEL_BODY_X){
-                        float omega[3],lever_cross[3],target[3]={req.value[0],0.0f,0.0f};
+                        float omega[3],lever_cross[3],target[3]={0.0f,0.0f,0.0f};
                         if(!isfinite(req.value[0])||fabsf(req.value[0])>AID_WHEEL_MAX_MPS ||
                            !isfinite(sigma)||sigma<AID_SIGMA_VEL_MIN_MPS||sigma>AID_SIGMA_VEL_MAX_MPS){
                             ok=0;
                         }else{
                             for(int i=0;i<3;i++)omega[i]=gyro[i]-eskf.gyro_bias[i];
+                            target[0]=req.value[0];
+                            if(age>=AID_WHEEL_COMP_MIN_AGE_US){
+                                float old_vx=0.0f,current_body[3];
+                                if(eskf_nav_get_body_velocity(&eskf,current_body) &&
+                                   wheel_history_lookup(&wheel_history,now_us,age,&old_vx)){
+                                    /* Translate delayed wheel speed to an equivalent
+                                     * current-epoch measurement. The innovation is
+                                     * approximately preserved: z_now-h_now=z_old-h_old. */
+                                    target[0]+=current_body[0]-old_vx;
+                                }
+                            }
                             lever_cross[0]=omega[1]*settings.imu_position_body[2]-omega[2]*settings.imu_position_body[1];
                             lever_cross[1]=omega[2]*settings.imu_position_body[0]-omega[0]*settings.imu_position_body[2];
                             lever_cross[2]=omega[0]*settings.imu_position_body[1]-omega[1]*settings.imu_position_body[0];
