@@ -23,4 +23,9 @@ STUB
 out="$tmp/test_agent1_imu_health"
 gcc -std=c11 -O2 -Wall -Wextra -Werror -I"$tmp" -IInc \
   tests/test_agent1_imu_health.c Src/imu_mpu6xxx.c -o "$out"
+
+# Run the same hardware-driver test with the opt-in 1000Hz profile.
+out_1k="$tmp/test_agent1_imu_health_1khz"
+gcc -std=c11 -O2 -Wall -Wextra -Werror -DIMU_PROFILE_1KHZ=1 -I"$tmp" -IInc   tests/test_agent1_imu_health.c Src/imu_mpu6xxx.c -o "$out_1k"
+"$out_1k"
 "$out"

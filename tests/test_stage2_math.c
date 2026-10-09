@@ -105,6 +105,18 @@ int main(void){
      ck(memcmp(q_before,f.q,sizeof(q_before))==0 && memcmp(v_before,f.velocity,sizeof(v_before))==0 && memcmp(p_before,f.position,sizeof(p_before))==0,
         "covariance recovery preserves nominal attitude/velocity/position");}
 
+    /* Even gentle 0.02 g acceleration (~0.20 m/s2) must remain translational.
+     * A 6-axis IMU cannot use accelerometer direction as gravity while moving. */
+    eskf_nav_init(&f,a0);
+    for(int k=0;k<500;k++){
+        float da[3]={0,0,0},dv[3]={0.02f*g*0.01f,0,g*0.01f};
+        (void)eskf_nav_predict_delta(&f,da,dv,0.01f);
+        if((k&1)==0){float am[3]={0.02f*g,0,g};(void)eskf_nav_correct_gravity(&f,am,0);}
+    }
+    {float rr=0,pp=0,yy=0;eskf_nav_get_euler_deg(&f,&rr,&pp,&yy);
+     ck(fabsf(pp)<0.2f,"moving 0.02g acceleration is not fused as false pitch");
+     ck(f.velocity[0]>0.90f,"moving 0.02g acceleration remains real forward velocity");}
+
     /* Sustained 0.1 g horizontal acceleration has magnitude ~1.005 g and must
      * not be mistaken for a 5.7 degree gravity tilt while moving. */
     eskf_nav_init(&f,a0);
@@ -159,6 +171,39 @@ int main(void){
     }
     printf("3x3 max reconstruction error = %.9f m/s2\n",maxerr);
     ck(maxerr<1e-4f,"full 3x3 calibration reconstructs six axes");
+
+    /* Six-face at a temperature different from the reference must fit the
+     * reference-temperature offset, not absorb thermal slope a second time. */
+    PersistedSettings ts; memset(&ts,0,sizeof(ts));
+    ts.accel_transform[0]=ts.accel_transform[4]=ts.accel_transform[8]=1.0f;
+    ts.sensor_to_body_q[0]=1.0f; ts.calibration_temp_c=25.0f;
+    ts.accel_temp_slope[0]=0.010f; ts.accel_temp_slope[1]=-0.008f; ts.accel_temp_slope[2]=0.005f;
+    ImuCalibration tc; imu_calibration_start_rotate(&tc);
+    const float cal_temp=45.0f,dtemp=20.0f;
+    for(int axis=0;axis<3;axis++)for(int signi=0;signi<2;signi++){
+        float truth[3]={0,0,0};truth[axis]=(signi?-1.0f:1.0f)*g;
+        ImuSample sample={0};sample.temperature_c=cal_temp;
+        for(int r=0;r<3;r++){
+            sample.accel_mps2[r]=off[r]+ts.accel_temp_slope[r]*dtemp;
+            for(int j=0;j<3;j++)sample.accel_mps2[r]+=A[r][j]*truth[j];
+        }
+        for(uint32_t n=0U;n<(ROTATE_FACE_STABLE_SAMPLES+ROTATE_FACE_MIN_SAMPLES+3U);n++)
+            imu_calibration_update(&tc,&sample,&ts);
+    }
+    ck(tc.coverage==0x3FU,"thermal six-face acquires all orientations");
+    ck(imu_calibration_finish_rotate(&tc,&ts),"thermal-aware six-face calibration succeeds");
+    float thermal_maxerr=0.0f;
+    for(int axis=0;axis<3;axis++)for(int signi=0;signi<2;signi++){
+        float truth[3]={0,0,0};truth[axis]=(signi?-1.0f:1.0f)*g;
+        ImuSample raw={0};raw.temperature_c=cal_temp;
+        for(int r=0;r<3;r++){
+            raw.accel_mps2[r]=off[r]+ts.accel_temp_slope[r]*dtemp;
+            for(int j=0;j<3;j++)raw.accel_mps2[r]+=A[r][j]*truth[j];
+        }
+        float ac[3],gy[3];imu_apply_static_calibration(&raw,&ts,ac,gy);
+        for(int i=0;i<3;i++){float e=fabsf(ac[i]-truth[i]);if(e>thermal_maxerr)thermal_maxerr=e;}
+    }
+    ck(thermal_maxerr<1e-4f,"six-face calibration does not double-count thermal accel shift");
 
     ImuCalibration bad; imu_calibration_start_rotate(&bad); PersistedSettings before=s;
     ck(!imu_calibration_finish_rotate(&bad,&s),"incomplete rotate calibration rejected");

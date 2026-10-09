@@ -20,7 +20,6 @@ setup(
     maintainer_email="dev@local.invalid",
     description="Slip-aware wheel/LIO/GNSS fusion for the hoverboard sideboard P2 stack.",
     license="MIT",
-    tests_require=["pytest"],
     entry_points={
         "console_scripts": [
             "p2_fusion_node = sideboard_p2_fusion.p2_fusion_node:main",

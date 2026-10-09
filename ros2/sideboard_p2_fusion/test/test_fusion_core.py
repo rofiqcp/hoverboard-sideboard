@@ -96,7 +96,9 @@ def test_stale_reference_pauses_calibration_and_slip_comparison():
 
     assert not out.reference_valid
     assert core.scale_update_count == count
-    assert out.slip_probability < 0.5
+    # No LiDAR data is not evidence of recovery from a prior slip.
+    assert out.slip_probability >= 0.5
+    assert out.wheel_sigma_mps >= core.cfg.stale_reference_sigma_floor_mps
 
 
 def test_stale_steering_disables_yaw_evidence_and_geometry_learning():
@@ -162,3 +164,57 @@ def test_planar_lio_body_to_base_transform():
     assert abs(x - 9.75) < 1e-9
     assert abs(y - 6.0) < 1e-9
     assert abs(yaw - (math.pi / 2.0 + 0.10)) < 1e-9
+
+
+def test_severe_slip_does_not_become_healthy_when_lio_goes_stale():
+    core = P2FusionCore()
+    t = 1.0
+    for _ in range(100):
+        t += 0.02
+        core.update_reference_velocity(t, 2.0, 0.0)
+        high=core.update_wheel(t, 4.0, 0.0, steering_valid=False)
+    assert high.severe_slip and high.wheel_sigma_mps==core.cfg.wheel_sigma_max_mps
+    for _ in range(100):
+        t += 0.02
+        stale=core.update_wheel(t, 4.0, 0.0, steering_valid=False)
+    assert not stale.reference_valid
+    assert stale.severe_slip
+    assert stale.wheel_sigma_mps==core.cfg.wheel_sigma_max_mps
+
+
+def test_external_slip_evidence_expires_without_updates():
+    core=P2FusionCore()
+    core.set_external_slip_ratio(.25,stamp_s=1.0)
+    core.update_wheel(1.1,2.0,0.0)
+    assert core.external_slip_valid
+    core.update_wheel(1.7,2.0,0.0)
+    assert not core.external_slip_valid
+    assert core.last_wheel_stamp_s==1.7
+
+
+def test_missing_lio_has_conservative_wheel_sigma_floor():
+    core=P2FusionCore()
+    out=core.update_wheel(1.0,2.0,0.0)
+    assert not out.reference_valid
+    assert out.wheel_sigma_mps>=core.cfg.stale_reference_sigma_floor_mps
+
+
+def test_external_slip_accepts_small_header_arrival_skew():
+    core=P2FusionCore()
+    core.set_external_slip_ratio(0.20,stamp_s=2.10)
+    core.update_wheel(2.07,2.0,0.0)
+    assert core.external_slip_valid
+    # Wheel messages MUST remain monotonic even when two ROS topics have skew.
+    # A truly late/out-of-order wheel packet is dropped, not allowed to
+    # rewrite the core timeline. Check the stale external slip case separately.
+    try:
+        core.update_wheel(1.89,2.0,0.0)
+    except ValueError as exc:
+        assert "non-monotonic" in str(exc)
+    else:
+        raise AssertionError("out-of-order wheel sample unexpectedly accepted")
+    assert core.external_slip_valid
+    older=P2FusionCore()
+    older.set_external_slip_ratio(0.20,stamp_s=2.10)
+    older.update_wheel(1.89,2.0,0.0)
+    assert not older.external_slip_valid

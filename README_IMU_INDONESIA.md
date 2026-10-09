@@ -137,16 +137,22 @@ Fault injection yang sudah diuji langsung: frame parsial, 400-byte garbage burst
 
 ## Pemakaian paling sederhana
 
-Port serial dipilih otomatis: firmware/tool memprioritaskan `/dev/serial/by-id/usb-1a86_USB_Serial-if00-port0`, lalu fallback ke `/dev/ttyUSB0`. Baud aplikasi dan bootloader sama-sama **921600**.
+Port serial auto tidak lagi dipilih hanya berdasarkan nama `ttyUSB/ttyACM`. Tool memfilter USB-UART CH340/CH341, PL2303, atau FTDI lalu melakukan identity probe: aplikasi harus mengirim frame sideboard `F0/F5` valid atau bootloader harus menjawab `INFO F8`. Ini mencegah ESC, CP2102 IMU, Android, atau port serial lain dipilih keliru. Baud aplikasi dan bootloader sama-sama **921600**.
 
 ```bash
 # Baca data terus-menerus tanpa menulis nama port
 python3 tools/imu/read_imu.py
 
+# Stream fokus navigation x/y/z dan vx/vy/vz; --every 1 menampilkan 50 Hz penuh
+python3 tools/imu/read_imu.py --mode nav --every 1
+
+# Gate stationary real-hardware: rate, packet loss, sensor lag, drift XYZ/VXYZ, health
+python3 tools/imu/validate_nav_stream.py --duration 60
+
 # Console live + command kalibrasi interaktif
 python3 tools/imu/calibrate_imu.py
 
-# Kalibrasi gyro saat board benar-benar diam, tunggu sampai DONE dan auto-save EEPROM
+# Kalibrasi gyro presisi: board benar-benar diam ~10 s, tunggu DONE + auto-save
 python3 tools/imu/calibrate_imu.py still
 
 # Wizard kalibrasi accelerometer enam sisi (+X,-X,+Y,-Y,+Z,-Z)
@@ -176,7 +182,7 @@ Jalur aktif sengaja tetap floating-point seperti pola ArduPilot/PX4; eksperimen 
 Alur runtime final Tahap 1:
 
 ```text
-MPU6xxx FIFO 200 Hz
+MPU6xxx FIFO 500 Hz (profile high-speed aktif)
   -> kalibrasi statik
   -> delta-angle + delta-velocity preintegrator + coning correction
   -> ESKF nominal 100 Hz (TIM2 hardware scheduler)
@@ -187,14 +193,14 @@ MPU6xxx FIFO 200 Hz
 ```
 
 Catatan penting:
-- `dt` FIFO mengikuti observed sample-rate sensor, bukan diasumsikan persis 200 Hz.
+- `dt` FIFO mengikuti observed sample-rate sensor dan timestamp per-sampel, bukan diasumsikan persis 500 Hz.
 - Startup calibration memakai sampel FIFO berbeda selama sekitar 2 detik.
 - Gagal kalibrasi tidak mengubah settings aktif/EEPROM (transactional commit).
 - Startup ZUPT dilepas hanya setelah motion persisten; master `stationary-off` melepasnya deterministik sebelum AGV bergerak.
 - Yaw tetap relative tanpa heading aiding eksternal.
 - Position/velocity IMU-only tetap dead-reckoning; Tahap 2 perlu wheel odometry / external aiding untuk bounded navigation saat kendaraan bergerak.
 
-## Tahap 2 navigation aiding + calibration IMU4 / telemetry v5 (2026-09-17)
+## Tahap 2 navigation aiding + calibration IMU4 / telemetry v6 (2026-09-17)
 
 EEPROM sekarang schema `IMU4` dan otomatis migrasi dari `IMU3`. Field baru meliputi full accelerometer transform 3x3, quaternion `sensor_to_body`, gyro/accel thermal slope, dan IMU lever-arm terhadap body origin. Loader memvalidasi CRC, finite/range seluruh parameter kritis, determinant matrix, dan quaternion.
 
@@ -222,7 +228,7 @@ python3 tools/imu/aiding_imu.py yaw 90 --sigma 2
 
 Wheel aiding mengobservasi body-forward velocity; NHC menahan body lateral/vertical velocity. Lever arm memakai koreksi `omega x r`. World velocity, world position, dan yaw memakai source reset ketika pertama acquire/ketika source timeout, lalu innovation fusion normal sesudah lock. Ini mencegah estimator menolak heading/velocity awal yang jauh dari state IMU-only.
 
-Protocol extended **v5** mempertahankan prefix v4 dan menambahkan temperatur hasil konversi firmware, `WHO_AM_I`, device class, serta observed FIFO sample-rate. Navigation validity/covariance status dan health-reset counter tetap dikirim. Native `COMM_GET_IMU_DATA=65` tetap kompatibel dan tidak berubah.
+Protocol extended **v6** mempertahankan seluruh prefix v5 dan menambahkan `sample_time_us`, yaitu epoch sampel FIFO terakhir yang benar-benar sudah diintegrasikan ke state ESKF. Host sekarang dapat menghitung `sensor_lag_us = snapshot_time_us - sample_time_us` secara langsung. Reader Python juga memakai skala raw yang sesuai profile aktif: high-speed 500 Hz = ±8 g (`4096 LSB/g`) dan ±1000 deg/s (`32.8 LSB/(deg/s)`). Navigation validity/covariance status dan health-reset counter tetap dikirim. Native `COMM_GET_IMU_DATA=65` tetap kompatibel dan tidak berubah.
 
 Safety ESKF Tahap 2 mencakup finite/range guards, absolute innovation guards, NIS gates, bounded correction step, realistic gyro/accel residual-bias limits, covariance/state health check, serta automatic estimator recovery bila state menjadi non-finite/tidak sehat. Yaw aiding tidak diizinkan menyeret gyro-bias residual hingga batas.
 

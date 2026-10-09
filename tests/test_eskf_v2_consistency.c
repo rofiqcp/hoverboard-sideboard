@@ -34,6 +34,24 @@ static float body_x_measurement(const EskfNav *f){
  return bx;
 }
 
+static void test_zero_nav_resets_motion_covariance(void){
+ const float g=GRAVITY_MPS2; float a0[3]={0,0,g}; EskfNav f; eskf_nav_init(&f,a0);
+ f.velocity[0]=3.0f; f.position[0]=12.0f;
+ f.P[3][0]=f.P[0][3]=0.2f; f.P[6][1]=f.P[1][6]=0.3f;
+ float q[4],gb[3],ab[3];memcpy(q,f.q,sizeof(q));memcpy(gb,f.gyro_bias,sizeof(gb));memcpy(ab,f.accel_bias,sizeof(ab));
+ eskf_nav_reset_motion(&f);
+ int zero=1,cross=1;
+ for(int i=0;i<3;i++){if(f.velocity[i]!=0.0f||f.position[i]!=0.0f)zero=0;}
+ for(int sidx=3;sidx<=8;sidx++)for(int j=0;j<ESKF_NAV_DIM;j++)if(j!=sidx && (fabsf(f.P[sidx][j])>1e-12f||fabsf(f.P[j][sidx])>1e-12f))cross=0;
+ check(zero,"zero-nav clears nominal velocity and position");
+ check(memcmp(q,f.q,sizeof(q))==0&&memcmp(gb,f.gyro_bias,sizeof(gb))==0&&memcmp(ab,f.accel_bias,sizeof(ab))==0,
+       "zero-nav preserves attitude and sensor biases");
+ check(cross&&fabsf(f.P[3][3]-ZUPT_SIGMA_MPS*ZUPT_SIGMA_MPS)<1e-9f&&
+       fabsf(f.P[6][6]-ZERO_NAV_POSITION_SIGMA_M*ZERO_NAV_POSITION_SIGMA_M)<1e-9f,
+       "zero-nav resets v/p covariance and stale cross-correlations");
+ check(eskf_nav_covariance_psd_check(&f),"zero-nav covariance remains PSD");
+}
+
 static void test_covariance_phase_invariance(void){
  const float g=GRAVITY_MPS2; EskfNav a,b; float a0[3]={0,0,g}; eskf_nav_init(&a,a0); eskf_nav_init(&b,a0);
  int propagation_ok=1;
@@ -208,6 +226,7 @@ static void test_tilted_yaw_jacobian(void){
 }
 
 int main(void){
+ test_zero_nav_resets_motion_covariance();
  test_covariance_phase_invariance();
  test_atomic_vector_updates();
  test_body_velocity_jacobian();

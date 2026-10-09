@@ -44,3 +44,22 @@ def test_p2_canonicalizes_fast_lio_frames_before_local_ekf():
     assert cfg["lio_canonical_topic"] == "/p2/lio/odometry"
     assert cfg["lio_output_frame"] == "odom"
     assert cfg["base_frame"] == "base_link"
+
+
+def test_lio_quaternion_validation_rejects_zero_and_nan_and_normalizes():
+    from types import SimpleNamespace
+    import math
+    from sideboard_p2_fusion.p2_fusion_node import quaternion_to_yaw
+    def quat(x,y,z,w): return SimpleNamespace(x=x,y=y,z=z,w=w)
+    assert math.isnan(quaternion_to_yaw(quat(0,0,0,0)))
+    assert math.isnan(quaternion_to_yaw(quat(0,0,float("nan"),1)))
+    assert abs(quaternion_to_yaw(quat(0,0,1.05*math.sin(.3),1.05*math.cos(.3)))-.6)<1e-8
+
+
+def test_lio_invalid_covariance_is_deweighted_not_forwarded():
+    from sideboard_p2_fusion.p2_fusion_node import safe_variance
+    import math
+    assert safe_variance(float("nan"),0.0009)==1e6
+    assert safe_variance(-1.0,0.0009)==1e6
+    assert safe_variance(0.0,0.0009)==0.0009
+    assert safe_variance(0.1,0.0009)==0.1

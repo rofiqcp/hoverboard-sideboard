@@ -102,8 +102,8 @@ class SerialWorker(QThread):
     def _write_log(self, d):
         if not self._writer:
             return
-        ax, ay, az = (x / 8192.0 * G for x in d["accel_raw"])
-        gx, gy, gz = (x / 65.5 * math.pi / 180.0 for x in d["gyro_raw"])
+        ax, ay, az = (x / float(d.get("accel_lsb_per_g", 8192.0)) * G for x in d["accel_raw"])
+        gx, gy, gz = (x / float(d.get("gyro_lsb_per_dps", 65.5)) * math.pi / 180.0 for x in d["gyro_raw"])
         cs, cc, ce, cp = d["cal"]
         row = dict(
             host_s=time.monotonic() - self._start,
@@ -871,8 +871,8 @@ class ImuDashboard(QMainWindow):
         self.m_position.set_value(f"{pos_norm:.3f}", f"x {px:+.3f} · y {py:+.3f} · z {pz:+.3f}")
         self.m_temp.set_value(f"{d['temp_c']:.1f}", f"WHOAMI 0x{d['imu_whoami']:02X} · class {d['imu_class']}")
 
-        ax, ay, az = (x / 8192.0 * G for x in d["accel_raw"])
-        gx, gy, gz = (x / 65.5 for x in d["gyro_raw"])
+        ax, ay, az = (x / float(d.get("accel_lsb_per_g", 8192.0)) * G for x in d["accel_raw"])
+        gx, gy, gz = (x / float(d.get("gyro_lsb_per_dps", 65.5)) for x in d["gyro_raw"])
         self.raw_accel.set_values(ax, ay, az)
         self.raw_gyro.set_values(gx, gy, gz)
         self.plot_acc.add_values(ax, ay, az)

@@ -70,6 +70,8 @@ class P2Config:
     wheelbase_learning_rate: float = 0.006
 
     reference_timeout_s: float = 0.20
+    external_slip_timeout_s: float = 0.50
+    stale_reference_sigma_floor_mps: float = 0.50
     scale_min_speed_mps: float = 0.60
     scale_max_yaw_rate_rads: float = 0.35
     geometry_min_speed_mps: float = 0.80
@@ -182,6 +184,7 @@ class P2FusionCore:
         self.slip_velocity_mps = 0.0
         self.external_slip_ratio = 0.0
         self.external_slip_valid = False
+        self.external_slip_stamp_s = 0.0
 
         self.last_wheel_stamp_s = 0.0
         self.last_corrected_wheel_mps = 0.0
@@ -194,40 +197,45 @@ class P2FusionCore:
         self.geometry_update_count = 0
 
     def restore(self, state: Dict[str, Any]) -> None:
+        """Restore only finite and bounded calibration values.
+
+        YAML permits .nan/.inf. Clamp alone is not safe for NaN, because
+        neither comparison is true and it can poison the RLS/covariance state.
+        Restore each independent field without partially accepting a bad one.
+        """
         if not isinstance(state, dict):
             return
-        if "wheel_scale" in state and math.isfinite(float(state["wheel_scale"])):
-            self.wheel_scale = clamp(
-                float(state["wheel_scale"]),
-                self.cfg.wheel_scale_min,
-                self.cfg.wheel_scale_max,
-            )
-            self.scale_rls.theta = self.wheel_scale
-        if "wheel_scale_covariance" in state:
+
+        def finite_bounded(name: str, lower: float, upper: float):
+            if name not in state:
+                return None
             try:
-                self.scale_rls.covariance = clamp(
-                    float(state["wheel_scale_covariance"]), 1.0e-7, 1.0e6
-                )
-            except (TypeError, ValueError):
-                pass
-        if "steering_zero_rad" in state:
-            try:
-                self.steering_zero_rad = clamp(
-                    float(state["steering_zero_rad"]),
-                    -self.cfg.steering_zero_limit_rad,
-                    self.cfg.steering_zero_limit_rad,
-                )
-            except (TypeError, ValueError):
-                pass
-        if "wheelbase_m" in state:
-            try:
-                self.wheelbase_m = clamp(
-                    float(state["wheelbase_m"]),
-                    self.cfg.wheelbase_min_m,
-                    self.cfg.wheelbase_max_m,
-                )
-            except (TypeError, ValueError):
-                pass
+                value = float(state[name])
+            except (TypeError, ValueError, OverflowError):
+                return None
+            return clamp(value, lower, upper) if math.isfinite(value) else None
+
+        scale = finite_bounded("wheel_scale", self.cfg.wheel_scale_min,
+                               self.cfg.wheel_scale_max)
+        if scale is not None:
+            self.wheel_scale = scale
+            self.scale_rls.theta = scale
+
+        covariance = finite_bounded("wheel_scale_covariance", 1.0e-7, 1.0e6)
+        if covariance is not None:
+            self.scale_rls.covariance = covariance
+
+        offset = finite_bounded("steering_zero_rad",
+                                -self.cfg.steering_zero_limit_rad,
+                                self.cfg.steering_zero_limit_rad)
+        if offset is not None:
+            self.steering_zero_rad = offset
+
+        wheelbase = finite_bounded("wheelbase_m",
+                                   self.cfg.wheelbase_min_m,
+                                   self.cfg.wheelbase_max_m)
+        if wheelbase is not None:
+            self.wheelbase_m = wheelbase
 
     def snapshot(self) -> Dict[str, Any]:
         return {
@@ -240,10 +248,20 @@ class P2FusionCore:
             "config": asdict(self.cfg),
         }
 
-    def set_external_slip_ratio(self, ratio: float, valid: bool = True) -> None:
-        if valid and math.isfinite(ratio):
+    def set_external_slip_ratio(
+        self, ratio: float, valid: bool = True, stamp_s: Optional[float] = None
+    ) -> None:
+        # Use the same (ROS/header) time domain as wheel messages, never host
+        # monotonic against a ROS timestamp. Legacy callers use last wheel time.
+        stamp = self.last_wheel_stamp_s if stamp_s is None else float(stamp_s)
+        if valid and math.isfinite(ratio) and math.isfinite(stamp):
+            # A delayed out-of-order sample must not renew the slip lease
+            # or overwrite a newer severe-slip report.
+            if self.external_slip_valid and stamp < self.external_slip_stamp_s:
+                return
             self.external_slip_ratio = clamp(ratio, -2.0, 2.0)
             self.external_slip_valid = True
+            self.external_slip_stamp_s = stamp
         else:
             self.external_slip_valid = False
 
@@ -251,6 +269,10 @@ class P2FusionCore:
         self, stamp_s: float, speed_mps: float, yaw_rate_rads: float
     ) -> None:
         if not all(math.isfinite(v) for v in (stamp_s, speed_mps, yaw_rate_rads)):
+            return
+        # Replay/out-of-order LiDAR messages cannot reverse the filter
+        # reference timeline and corrupt acceleration/scale learning.
+        if self.reference.valid and stamp_s <= self.reference.stamp_s:
             return
         accel = 0.0
         if self.reference.valid:
@@ -408,6 +430,16 @@ class P2FusionCore:
             for v in (stamp_s, raw_wheel_speed_mps, steering_angle_rad)
         ):
             raise ValueError("non-finite P2 wheel input")
+        # ROS queues may deliver delayed or duplicate wheel measurements.
+        # Updating RLS/slip state with a backwards dt would corrupt history.
+        if self.last_wheel_stamp_s > 0.0 and stamp_s <= self.last_wheel_stamp_s:
+            raise ValueError("non-monotonic P2 wheel timestamp")
+
+        if self.external_slip_valid and (
+            stamp_s < self.external_slip_stamp_s - 0.20  # minor callback/header skew is expected
+            or stamp_s - self.external_slip_stamp_s > self.cfg.external_slip_timeout_s
+        ):
+            self.external_slip_valid = False
 
         corrected = raw_wheel_speed_mps * self.wheel_scale
         dt = 0.02
@@ -521,12 +553,10 @@ class P2FusionCore:
                 self.cfg.dob_max_slip_velocity_mps,
             )
         else:
-            self.slip_probability = ewma(
-                self.slip_probability, 0.0, dt, 0.60
-            )
-            self.slip_velocity_mps = ewma(
-                self.slip_velocity_mps, 0.0, dt, 0.60
-            )
+            # Missing LIO/reference is not evidence that prior slip has ended.
+            # Hold the last conservative estimate until independent reference
+            # observations return; no calibration is allowed in this mode.
+            pass
 
         calibration_updated = False
         if fresh:
@@ -555,6 +585,8 @@ class P2FusionCore:
             self.cfg.wheel_sigma_base_mps,
             self.cfg.wheel_sigma_max_mps,
         )
+        if not fresh:
+            sigma = max(sigma, self.cfg.stale_reference_sigma_floor_mps)
 
         severe = self.slip_probability >= self.cfg.severe_slip_probability
         if severe:

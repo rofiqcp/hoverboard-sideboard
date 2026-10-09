@@ -26,10 +26,26 @@ def stamp_to_sec(stamp) -> float:
 
 
 def quaternion_to_yaw(q) -> float:
-    # Standard ROS quaternion (x,y,z,w), ENU yaw about +Z.
-    siny = 2.0 * (q.w * q.z + q.x * q.y)
-    cosy = 1.0 - 2.0 * (q.y * q.y + q.z * q.z)
-    return math.atan2(siny, cosy)
+    # Reject NaN/zero/badly unnormalized LiDAR attitude. Normalize before yaw
+    # extraction so slight quaternion norm error cannot corrupt the frame.
+    qx,qy,qz,qw=(float(q.x),float(q.y),float(q.z),float(q.w))
+    n2=qx*qx+qy*qy+qz*qz+qw*qw
+    if not math.isfinite(n2) or not (0.5 <= n2 <= 1.5):
+        return float("nan")
+    siny=2.0*(qw*qz+qx*qy)/n2
+    cosy=1.0-2.0*(qy*qy+qz*qz)/n2
+    return math.atan2(siny,cosy)
+
+
+def safe_variance(value: float, minimum: float) -> float:
+    """Invalid covariance means unknown quality, never high confidence."""
+    try:
+        v=float(value)
+    except (TypeError,ValueError):
+        return 1.0e6
+    if not math.isfinite(v) or v < 0.0:
+        return 1.0e6
+    return max(v,minimum)
 
 
 class P2FusionNode(Node):
@@ -229,6 +245,14 @@ class P2FusionNode(Node):
                 f.flush()
                 os.fsync(f.fileno())
             os.replace(tmp, self.calibration_file)
+            # fsync the parent directory as well: file fsync alone does not
+            # guarantee the atomic rename survives an unexpected power loss.
+            if os.name == "posix":
+                dir_fd = os.open(directory or ".", os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+                try:
+                    os.fsync(dir_fd)
+                finally:
+                    os.close(dir_fd)
         finally:
             try:
                 if os.path.exists(tmp):
@@ -255,7 +279,10 @@ class P2FusionNode(Node):
             )
 
     def _external_slip_cb(self, msg: Float32) -> None:
-        self.core.set_external_slip_ratio(float(msg.data), True)
+        self.core.set_external_slip_ratio(
+            float(msg.data), True,
+            stamp_s=self.get_clock().now().nanoseconds * 1.0e-9,
+        )
 
     def _lio_cb(self, msg: Odometry) -> None:
         stamp_s = self._message_time(msg)
@@ -263,6 +290,10 @@ class P2FusionNode(Node):
         raw_y = float(msg.pose.pose.position.y)
         raw_yaw = quaternion_to_yaw(msg.pose.pose.orientation)
         if not all(math.isfinite(v) for v in (stamp_s, raw_x, raw_y, raw_yaw)):
+            return
+        if self.last_lio_pose is not None and stamp_s <= self.last_lio_pose[0]:
+            # Do not regress the origin for the next velocity differentiation
+            # and do not publish a backwards-stamped canonical odometry frame.
             return
 
         x, y, yaw = transform_planar_pose(
@@ -344,12 +375,12 @@ class P2FusionNode(Node):
         ) ** 2
         src_cov = source.pose.covariance
         cov = [0.0] * 36
-        cov[0] = max(abs(float(src_cov[0])), pos_floor2)
-        cov[7] = max(abs(float(src_cov[7])), pos_floor2)
+        cov[0] = safe_variance(src_cov[0], pos_floor2)
+        cov[7] = safe_variance(src_cov[7], pos_floor2)
         cov[14] = 1.0e6
         cov[21] = 1.0e6
         cov[28] = 1.0e6
-        cov[35] = max(abs(float(src_cov[35])), yaw_floor2)
+        cov[35] = safe_variance(src_cov[35], yaw_floor2)
         out.pose.covariance = cov
 
         twist_cov = [0.0] * 36
@@ -488,9 +519,12 @@ class P2FusionNode(Node):
         elif self.last_output.severe_slip:
             st.level = DiagnosticStatus.ERROR
             st.message = "severe wheel slip; covariance maximally inflated"
+        elif wheel_age > 0.3:
+            st.level = DiagnosticStatus.WARN
+            st.message = "wheel odometry stale"
         elif ref_age > self.core.cfg.reference_timeout_s:
             st.level = DiagnosticStatus.WARN
-            st.message = "LIO reference stale; calibration/slip comparison paused"
+            st.message = "LIO reference stale; wheel covariance conservative"
         elif self.last_output.slip_probability > 0.50:
             st.level = DiagnosticStatus.WARN
             st.message = "wheel slip probability elevated"

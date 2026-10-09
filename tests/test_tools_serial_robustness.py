@@ -92,6 +92,47 @@ class RobustnessTests(unittest.TestCase):
         self.assertIn("reconnect=1",text)
         self.assertIn("valid=3",text)
 
+    def test_common_auto_open_requires_sideboard_identity(self):
+        wrong = FakePort("/dev/ttyUSB1"); wrong.is_open = False
+        right = FakePort("/dev/ttyUSB2"); right.is_open = False
+        probes = iter((False, True))
+        with mock.patch.object(serial_common, "sideboard_candidates",
+                               return_value=["/dev/ttyUSB1", "/dev/ttyUSB2"]),              mock.patch.object(serial_common.serial, "Serial",
+                               side_effect=[wrong, right]),              mock.patch.object(serial_common, "_probe_sideboard_identity",
+                               side_effect=lambda p: next(probes)):
+            got = serial_common.open_sideboard_port("auto", attempts=1, delay=0.0)
+        self.assertIs(got, right)
+        self.assertFalse(wrong.is_open)
+        self.assertTrue(right.is_open)
+
+    def test_auto_telemetry_probe_skips_wrong_supported_uart(self):
+        wrong = FakePort("/dev/ttyUSB1")
+        right = FakePort("/dev/ttyUSB2")
+        def fake_open(name, *args, **kwargs):
+            return wrong if name == "/dev/ttyUSB1" else right
+        def fake_read(port):
+            return (b"right" if port is right else b"wrong"), None
+        def fake_decode(payload):
+            return imu_data(1, 20000) if payload == b"right" else None
+        with mock.patch.object(read_imu, "sideboard_candidates",
+                               return_value=["/dev/ttyUSB1", "/dev/ttyUSB2"]),              mock.patch.object(read_imu, "open_sideboard_port", side_effect=fake_open),              mock.patch.object(read_imu, "read_frame", side_effect=fake_read),              mock.patch.object(read_imu, "decode_imu", side_effect=fake_decode),              mock.patch.object(read_imu, "decode_diag", return_value=None),              mock.patch.object(read_imu, "catch_bootloader",
+                               side_effect=TimeoutError("not sideboard")):
+            got = read_imu.open_telemetry_port("auto", attempts=1, delay=0.0)
+        self.assertIs(got, right)
+        self.assertFalse(wrong.is_open)
+        self.assertTrue(right.is_open)
+
+    def test_auto_candidates_ignore_android_and_cp2102(self):
+        ports = [
+            mock.Mock(device="/dev/ttyACM0", vid=0x04E8),  # Samsung Android
+            mock.Mock(device="/dev/ttyUSB0", vid=0x10C4), # CP2102 IMU
+            mock.Mock(device="/dev/ttyUSB1", vid=0x1A86), # CH340 sideboard class
+        ]
+        with mock.patch.object(serial_common.list_ports, "comports", return_value=ports),              mock.patch.object(serial_common.glob, "glob", return_value=[]),              mock.patch.object(serial_common, "_port_exists",
+                               side_effect=lambda p: p == "/dev/ttyUSB1"):
+            candidates = serial_common._candidates()
+        self.assertEqual(candidates, ["/dev/ttyUSB1"])
+
     def test_open_port_retries_until_available(self):
         fake=FakePort("COM18")
         fake.dtr=False; fake.rts=False; fake.is_open=False

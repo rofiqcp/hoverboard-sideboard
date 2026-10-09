@@ -36,10 +36,13 @@ static uint32_t last_fifo_sample_time_us;
 static uint8_t have_fifo_sample_time;
 static int16_t temperature_raw_cache;
 static uint8_t temperature_read_divider;
+static uint8_t temperature_cache_valid;
 static int write_reg(uint8_t reg, uint8_t value)
 {
+    /* Configuration writes are a few I2C bytes, never allow a single failed
+     * write to stall multiple 5ms scheduler periods. */
     if (HAL_I2C_Mem_Write(&hi2c1, MPU6XXX_I2C_ADDR, reg,
-                          I2C_MEMADD_SIZE_8BIT, &value, 1U, 20U) == HAL_OK) {
+                          I2C_MEMADD_SIZE_8BIT, &value, 1U, 5U) == HAL_OK) {
         return 1;
     }
     runtime_health.i2c_error_count++;
@@ -48,8 +51,13 @@ static int write_reg(uint8_t reg, uint8_t value)
 
 static int read_bytes(uint8_t reg, uint8_t *data, uint16_t len)
 {
+    /* At 400kHz, normal <=8 FIFO records (96B) fit within 5ms including
+     * HAL margin; larger bounded recovery bursts (up to 192B) get 8ms.
+     * Two classes instead of an integer divide also save critical F103 flash.
+     * This is the fault timeout, not the normal transfer duration. */
+    uint32_t timeout_ms = len <= 96U ? 5U : 8U;
     if (HAL_I2C_Mem_Read(&hi2c1, MPU6XXX_I2C_ADDR, reg,
-                         I2C_MEMADD_SIZE_8BIT, data, len, 20U) == HAL_OK) {
+                         I2C_MEMADD_SIZE_8BIT, data, len, timeout_ms) == HAL_OK) {
         return 1;
     }
     runtime_health.i2c_error_count++;
@@ -224,6 +232,7 @@ int imu_mpu6xxx_init(void)
     have_fifo_sample_time = 0U;
     temperature_raw_cache = 0;
     temperature_read_divider = 0U;
+    temperature_cache_valid = 0U;
 
     if (!write_reg(REG_PWR_MGMT_1, 0x80U)) return 0;
     HAL_Delay(100U);
@@ -278,8 +287,8 @@ int imu_mpu6xxx_read_fifo(ImuSample *samples, uint8_t max_samples, uint8_t *out_
     uint8_t count_b[2];
     uint8_t status = 0U;
     uint8_t temp_b[2] = {0U, 0U};
-    uint8_t fifo_b[12U * 8U];
-    if (!samples || !out_count || max_samples == 0U || max_samples > 8U) return 0;
+    uint8_t fifo_b[12U * IMU_FIFO_BATCH_CAPACITY];
+    if (!samples || !out_count || max_samples == 0U || max_samples > IMU_FIFO_BATCH_CAPACITY) return 0;
     *out_count = 0U;
     runtime_health.last_accel_clip_mask = 0U;
     runtime_health.last_gyro_clip_mask = 0U;
@@ -322,12 +331,15 @@ int imu_mpu6xxx_read_fifo(ImuSample *samples, uint8_t max_samples, uint8_t *out_
     uint16_t read_len = (uint16_t)packet_count * FIFO_PACKET_BYTES;
     if (!read_bytes(REG_FIFO_R_W, fifo_b, read_len)) return 0;
 
-    /* Temperatur berubah lambat. Baca sekitar 10 Hz, bukan 100 Hz, agar bus
-     * I2C punya margin lebih besar untuk FIFO 200 Hz. */
-    if (++temperature_read_divider >= 10U || temperature_raw_cache == 0) {
+    /* Maintain temperature read at ~10Hz in either 100 or 200Hz service
+     * profile. Avoid doubling I2C overhead when increasing service rate. */
+    /* Raw temperature 0 is a VALID measurement (nominal offset temperature);
+     * don't treat it as an uninitialized cache or issue I2C reads every tick. */
+    if (++temperature_read_divider >= IMU_TEMP_READ_DIVIDER || !temperature_cache_valid) {
         temperature_read_divider = 0U;
         if (read_bytes(REG_TEMP_OUT_H, temp_b, 2U)) {
             temperature_raw_cache = be_i16(temp_b);
+            temperature_cache_valid = 1U;
         }
     }
     int16_t temp_raw = temperature_raw_cache;
@@ -349,9 +361,9 @@ int imu_mpu6xxx_read_fifo(ImuSample *samples, uint8_t max_samples, uint8_t *out_
         if (elapsed_us >= 1000000U) {
             float measured = (float)fifo_stats.rate_window_samples * 1000000.0f /
                              (float)elapsed_us;
-            float nominal = (float)MPU6XXX_SAMPLE_HZ;
-            if (measured < nominal * 0.95f) measured = nominal * 0.95f;
-            if (measured > nominal * 1.05f) measured = nominal * 1.05f;
+            /* Health output must report the observed rate, not an artificially
+             * clamped 95..105% "healthy-looking" value. Timestamp propagation
+             * below has its own nominal fallback when the rate is implausible. */
             fifo_stats.observed_sample_hz = 0.9f * fifo_stats.observed_sample_hz +
                                             0.1f * measured;
             fifo_stats.rate_window_start_us = now_us;
@@ -371,7 +383,7 @@ int imu_mpu6xxx_read_fifo(ImuSample *samples, uint8_t max_samples, uint8_t *out_
     for (uint8_t n = 0U; n < packet_count; n++) {
         const uint8_t *b = &fifo_b[(uint16_t)n * FIFO_PACKET_BYTES];
         ImuSample *s = &samples[n];
-        memset(s, 0, sizeof(*s));
+        /* Every named ImuSample field is assigned below; avoid per-packet memset. */
         s->accel_raw[0] = be_i16(&b[0]);
         s->accel_raw[1] = be_i16(&b[2]);
         s->accel_raw[2] = be_i16(&b[4]);

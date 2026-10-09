@@ -122,36 +122,53 @@ static int finish_still(ImuCalibration *c, PersistedSettings *set)
     return 1;
 }
 
-static int select_face(const ImuSample *s)
+static int select_face(const ImuSample *s, const PersistedSettings *settings,
+                       float accel_ref[3])
 {
-    if (!sample_still(s)) return -1;
+    float dtemp=s->temperature_c-settings->calibration_temp_c;
+    if(dtemp>60.0f)dtemp=60.0f;
+    if(dtemp<-60.0f)dtemp=-60.0f;
+    for(int i=0;i<3;i++)
+        accel_ref[i]=s->accel_mps2[i]-settings->accel_temp_slope[i]*dtemp;
+
+    float gyro_norm=sqrtf(s->gyro_rads[0]*s->gyro_rads[0]+
+                          s->gyro_rads[1]*s->gyro_rads[1]+
+                          s->gyro_rads[2]*s->gyro_rads[2])*57.2957795f;
+    float accel_norm=sqrtf(accel_ref[0]*accel_ref[0]+
+                           accel_ref[1]*accel_ref[1]+
+                           accel_ref[2]*accel_ref[2]);
+    if(gyro_norm>=STARTUP_STILL_GYRO_DPS ||
+       fabsf(accel_norm/GRAVITY_MPS2-1.0f)>=STARTUP_STILL_ACCEL_ERR_G) return -1;
+
     int axis=0;
-    if (fabsf(s->accel_mps2[1])>fabsf(s->accel_mps2[axis])) axis=1;
-    if (fabsf(s->accel_mps2[2])>fabsf(s->accel_mps2[axis])) axis=2;
-    if (fabsf(s->accel_mps2[axis]) < ROTATE_FACE_AXIS_MIN_G*GRAVITY_MPS2) return -1;
-    for (int i=0;i<3;i++) {
-        if (i!=axis && fabsf(s->accel_mps2[i]) > ROTATE_FACE_OTHER_MAX_G*GRAVITY_MPS2) return -1;
-    }
-    return axis*2 + (s->accel_mps2[axis] < 0.0f ? 1 : 0);
+    if(fabsf(accel_ref[1])>fabsf(accel_ref[axis]))axis=1;
+    if(fabsf(accel_ref[2])>fabsf(accel_ref[axis]))axis=2;
+    if(fabsf(accel_ref[axis])<ROTATE_FACE_AXIS_MIN_G*GRAVITY_MPS2)return -1;
+    for(int i=0;i<3;i++)
+        if(i!=axis && fabsf(accel_ref[i])>ROTATE_FACE_OTHER_MAX_G*GRAVITY_MPS2)return -1;
+    return axis*2+(accel_ref[axis]<0.0f?1:0);
 }
 
-static void update_rotate(ImuCalibration *c,const ImuSample *s)
+static void update_rotate(ImuCalibration *c,const ImuSample *s,
+                          const PersistedSettings *settings)
 {
-    int face=select_face(s);
-    if (face<0) { c->current_face=-1; c->face_stable_count=0U; return; }
-    if (c->current_face!=face) { c->current_face=(int8_t)face; c->face_stable_count=1U; return; }
-    if (c->face_stable_count<ROTATE_FACE_STABLE_SAMPLES) { c->face_stable_count++; return; }
-    if (c->face_count[face] < 60000U) {
-        for (int i=0;i<3;i++) c->face_sum[face][i]+=s->accel_mps2[i];
-        c->face_count[face]++;
-        c->samples++;
+    /* Fit accel calibration at calibration_temp_c. Thermal shift is removed
+     * before centroid accumulation so six-face calibration at another
+     * temperature cannot double-count the configured temperature model. */
+    float accel_ref[3];
+    int face=select_face(s,settings,accel_ref);
+    if(face<0){c->current_face=-1;c->face_stable_count=0U;return;}
+    if(c->current_face!=face){c->current_face=(int8_t)face;c->face_stable_count=1U;return;}
+    if(c->face_stable_count<ROTATE_FACE_STABLE_SAMPLES){c->face_stable_count++;return;}
+    if(c->face_count[face]<60000U){
+        for(int i=0;i<3;i++)c->face_sum[face][i]+=accel_ref[i];
+        c->face_count[face]++;c->samples++;
     }
-    if (c->face_count[face]>=ROTATE_FACE_MIN_SAMPLES) c->coverage|=(uint8_t)(1U<<face);
+    if(c->face_count[face]>=ROTATE_FACE_MIN_SAMPLES)c->coverage|=(uint8_t)(1U<<face);
 
     uint32_t accepted=0U;
-    for (int f=0;f<6;f++) {
-        accepted += c->face_count[f] < ROTATE_FACE_MIN_SAMPLES ? c->face_count[f] : ROTATE_FACE_MIN_SAMPLES;
-    }
+    for(int f=0;f<6;f++)
+        accepted+=c->face_count[f]<ROTATE_FACE_MIN_SAMPLES?c->face_count[f]:ROTATE_FACE_MIN_SAMPLES;
     c->progress=(uint16_t)((accepted*1000U)/(6U*ROTATE_FACE_MIN_SAMPLES));
 }
 
@@ -179,7 +196,7 @@ void imu_calibration_update(ImuCalibration *c,const ImuSample *raw,PersistedSett
         c->progress=(uint16_t)((c->samples*1000U)/MASTER_STILL_CAL_SAMPLES);
         if (c->samples>=MASTER_STILL_CAL_SAMPLES) (void)finish_still(c,settings);
     } else if (c->state==IMU_CAL_ROTATE) {
-        update_rotate(c,raw);
+        update_rotate(c,raw,settings);
     }
 }
 

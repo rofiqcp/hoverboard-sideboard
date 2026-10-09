@@ -269,9 +269,9 @@ static void startup_measure(StartupMeasurement *m)
     uint8_t error_streak = 0U;
     while (m->valid < STARTUP_CALIB_SAMPLES &&
            (uint32_t)(board_micros() - start_us) < 3500000U) {
-        ImuSample samples[8];
+        ImuSample samples[IMU_FIFO_BATCH_CAPACITY];
         uint8_t count = 0U;
-        if (!imu_mpu6xxx_read_fifo(samples, 8U, &count)) {
+        if (!imu_mpu6xxx_read_fifo(samples, IMU_FIFO_BATCH_CAPACITY, &count)) {
             if (++error_streak >= IMU_REINIT_ERROR_COUNT) {
                 board_i2c_recover();
                 (void)imu_mpu6xxx_init();
@@ -412,9 +412,11 @@ static int stillness_update(StillnessDetector *d, const float accel[3], const fl
         float R[3][3]; eskf_nav_rotation_matrix(eskf,R);
         float dot=accel[0]*R[2][0]+accel[1]*R[2][1]+accel[2]*R[2][2];
         float dot2=dot*dot;
-        /* enter <1.5 deg, exit >2.5 deg from predicted gravity direction. */
-        direction_enter=(dot>0.0f && dot2>0.9993148f*accel_n2);
-        direction_exit_bad=(dot<=0.0f || dot2<0.9980973f*accel_n2);
+        /* High-sensitivity startup motion gate. 0.35 deg enter / 0.50 deg
+         * exit rejects ~0.01 g horizontal acceleration before it can be
+         * mistaken for rest/gravity while retaining hysteresis. */
+        direction_enter=(dot>0.0f && dot2>0.9999627f*accel_n2);
+        direction_exit_bad=(dot<=0.0f || dot2<0.99992385f*accel_n2);
     }
     int enter_ok=gyro_n2<enter_w2 && accel_n2>enter_g_lo && accel_n2<enter_g_hi && direction_enter;
     int exit_bad=gyro_n2>exit_w2 || accel_n2<exit_g_lo || accel_n2>exit_g_hi || direction_exit_bad;
@@ -427,7 +429,7 @@ static int stillness_update(StillnessDetector *d, const float accel[3], const fl
     } else {
         if (exit_bad) {
             if (d->exit_count<50U) d->exit_count++;
-            if (d->exit_count>=20U) { d->still=0U; d->enter_count=0U; }
+            if (d->exit_count>=5U) { d->still=0U; d->enter_count=0U; }
         } else d->exit_count=0U;
     }
     return d->still != 0U;
@@ -461,44 +463,6 @@ static float zero_rate_sigma_from_settings(const PersistedSettings *settings)
         if (sigma > 0.0100f) sigma = 0.0100f;
     }
     return sigma;
-}
-
-static void output_map_vec3(float v[3], uint16_t map)
-{
-    if(map & OUTPUT_MAP_SWAP_RP){float t=v[0];v[0]=v[1];v[1]=t;}
-    if(map & OUTPUT_MAP_INVERT_X)v[0]=-v[0];
-    if(map & OUTPUT_MAP_INVERT_Y)v[1]=-v[1];
-    if(map & OUTPUT_MAP_INVERT_Z)v[2]=-v[2];
-}
-
-static void output_map_raw3(int16_t v[3], uint16_t map)
-{
-    if(map & OUTPUT_MAP_SWAP_RP){int16_t t=v[0];v[0]=v[1];v[1]=t;}
-    if(map & OUTPUT_MAP_INVERT_X)v[0]=(v[0]==INT16_MIN)?INT16_MAX:(int16_t)-v[0];
-    if(map & OUTPUT_MAP_INVERT_Y)v[1]=(v[1]==INT16_MIN)?INT16_MAX:(int16_t)-v[1];
-    if(map & OUTPUT_MAP_INVERT_Z)v[2]=(v[2]==INT16_MIN)?INT16_MAX:(int16_t)-v[2];
-}
-
-static void apply_output_mapping(VescImuState *out,const PersistedSettings *settings)
-{
-    uint16_t map=(uint16_t)(settings->reserved & OUTPUT_MAP_MASK);
-    if(!map)return;
-    output_map_raw3(out->raw.accel_raw,map);
-    output_map_raw3(out->raw.gyro_raw,map);
-    output_map_vec3(out->accel_cal,map);
-    output_map_vec3(out->gyro_cal,map);
-    output_map_vec3(out->linear_accel_world,map);
-    output_map_vec3(out->velocity,map);
-    output_map_vec3(out->position,map);
-    if(map & OUTPUT_MAP_SWAP_RP){
-        float t=out->roll_rad;out->roll_rad=out->pitch_rad;out->pitch_rad=t;
-        t=out->attitude_std_rad[0];out->attitude_std_rad[0]=out->attitude_std_rad[1];out->attitude_std_rad[1]=t;
-        t=out->velocity_std_mps[0];out->velocity_std_mps[0]=out->velocity_std_mps[1];out->velocity_std_mps[1]=t;
-        t=out->position_std_m[0];out->position_std_m[0]=out->position_std_m[1];out->position_std_m[1]=t;
-    }
-    if(map & OUTPUT_MAP_INVERT_X)out->roll_rad=-out->roll_rad;
-    if(map & OUTPUT_MAP_INVERT_Y)out->pitch_rad=-out->pitch_rad;
-    if(map & OUTPUT_MAP_INVERT_Z)out->yaw_rad=-out->yaw_rad;
 }
 
 static void fill_telemetry(VescImuState *out,
@@ -589,7 +553,6 @@ static void fill_telemetry(VescImuState *out,
     out->temperature_c=raw->temperature_c;
     out->imu_whoami=di?di->whoami:0U; out->imu_class=di?(uint8_t)di->device_class:0U;
     out->observed_sample_hz=fs?fs->observed_sample_hz:0.0f;
-    apply_output_mapping(out,settings);
 }
 
 int main(void)
@@ -711,11 +674,8 @@ int main(void)
     /* ZUPT otomatis hanya diizinkan dari keadaan boot diam sampai gerak pertama.
      * Sesudah AGV mulai bergerak, ZUPT hanya dilakukan atas perintah master. */
     uint8_t startup_zupt = startup.stationary ? 1U : 0U;
-    /* Auto re-arm hanya berlaku untuk standalone/startup. Begitu master secara
-     * eksplisit menyatakan MOVING, IMU tidak boleh mengalahkan informasi itu. */
-    uint8_t auto_zupt_rearm_enabled = startup.stationary ? 1U : 0U;
     uint8_t master_stationary = 0U;
-    uint8_t auto_rearm_still_count = 0U;
+    uint32_t master_stationary_since_us = 0U;
     uint8_t zupt_divider = 0U;
     uint8_t zupt_phase = 0U;
     uint8_t gravity_divider = 1U;
@@ -752,6 +712,11 @@ int main(void)
         uint32_t pending_ticks = board_wait_imu_tick();
         (void)pending_ticks;
         uint32_t now_us = board_micros();
+        if (master_stationary && (uint32_t)(now_us-master_stationary_since_us) >
+                                  MASTER_STATIONARY_LEASE_US) {
+            master_stationary=0U;
+            startup_zupt=0U; /* silence from controller cannot authorize future ZUPT */
+        }
 
         /* Agent 1 performs the register audit internally at a low cadence. If
          * configuration is no longer trustworthy, no new IMU measurement is
@@ -773,9 +738,9 @@ int main(void)
             continue;
         }
 
-        ImuSample fifo_samples[8];
+        ImuSample fifo_samples[IMU_FIFO_BATCH_CAPACITY];
         uint8_t fifo_count = 0U;
-        if (!imu_mpu6xxx_read_fifo(fifo_samples, 8U, &fifo_count)) {
+        if (!imu_mpu6xxx_read_fifo(fifo_samples, IMU_FIFO_BATCH_CAPACITY, &fifo_count)) {
             service_bootloader_while_starting();
             if (++imu_error_streak >= IMU_REINIT_ERROR_COUNT) {
                 board_i2c_recover();
@@ -832,7 +797,11 @@ int main(void)
             imu_preintegrator_push(&preintegrator,gyro,accel,sample_dt);
             imu_calibration_update(&calibration,&raw,&settings);
         }
-        imu_apply_static_calibration(&raw,&settings,accel,gyro);
+        /* accel/gyro already contain the last calibrated FIFO sample.
+         * Recompute only when calibration changes the in-RAM settings during
+         * this batch (persistence/rollback handled below). */
+        if (calibration.event_saved_needed)
+            imu_apply_static_calibration(&raw,&settings,accel,gyro);
 
         ImuDelta delta;
         if (!imu_preintegrator_take(&preintegrator,&delta)) {
@@ -868,22 +837,23 @@ int main(void)
         /* Clipped values remain untouched for observability/diagnostics, but a
          * clipped acceleration batch cannot be trusted as a gravity/rest cue. */
         if (imu_health && (imu_health->last_accel_clip_mask || imu_health->last_gyro_clip_mask)) sample_is_still=0;
+        if (!sample_is_still) { master_stationary=0U; startup_zupt=0U; }
         if(recover_filter_if_unhealthy(&eskf,&raw,&settings,&preintegrator,
                                       &last_fifo_resync,(uint8_t)sample_is_still,&startup_zupt,&nominal_backup)) {
             aid_status.reject_count++;
             continue;
         }
         /*
-         * Gravity correction 50 Hz. Saat bergerak tetap memakai gate magnitude
-         * + direction yang jauh lebih ketat dan measurement-noise lebih besar.
-         * Pure gyro propagation diuji terhadap tes2 dan justru memperbesar drift,
-         * jadi moving correction dipertahankan tetapi tidak pernah dianggap
-         * sebagai observasi posisi.
+         * Gravity correction 50 Hz hanya saat rest terkonfirmasi. Pada IMU
+         * 6-axis, linear acceleration dan gravity tilt tidak observable secara
+         * terpisah; correction saat bergerak merusak vx/vy/vz. Python/master
+         * dapat menyatakan stationary secara eksplisit setelah kendaraan stop.
          */
-        if (++gravity_divider >= 2U) {
+        if (++gravity_divider >= IMU_GRAVITY_DIVIDER) {
             gravity_divider = 0U;
-            if (!imu_health || imu_health->last_accel_clip_mask==0U)
-                gravity_ok = (uint8_t)eskf_nav_correct_gravity(&eskf, accel_for_gravity, sample_is_still);
+            /* Calibration request alone must not bypass sensor-confirmed rest. */
+            if ((!imu_health || imu_health->last_accel_clip_mask==0U) && sample_is_still)
+                gravity_ok = (uint8_t)eskf_nav_correct_gravity(&eskf, accel_for_gravity, 1);
             else
                 gravity_ok = 0U;
         }
@@ -893,33 +863,7 @@ int main(void)
          * plus five 3x3 PSD blocks catch faults with much lower F103 flash/CPU cost. */
 
         zupt_applied = 0U;
-        if (startup_zupt && !sample_is_still) {
-            /* Gerak terdeteksi: lepaskan static hold. */
-            startup_zupt = 0U;
-            auto_rearm_still_count = 0U;
-        } else if (!startup_zupt && auto_zupt_rearm_enabled &&
-                   sample_is_still && !master_stationary) {
-            /*
-             * Estimator velocity tidak boleh dipakai untuk menentukan rest:
-             * justru velocity-lah state yang drift saat dead-reckoning. Setelah
-             * evidence IMU diam kontinu ~0.8 s (di luar hysteresis detector),
-             * zero velocity menjadi measurement yang valid dan boleh mereset
-             * state velocity secara eksplisit. STATIONARY_OFF men-disable path
-             * ini untuk AGV yang sedang diperintah bergerak konstan.
-             */
-            if (auto_rearm_still_count < AUTO_ZUPT_REARM_STILL_SAMPLES)
-                auto_rearm_still_count++;
-            if (auto_rearm_still_count >= AUTO_ZUPT_REARM_STILL_SAMPLES) {
-                const float zero_velocity[3]={0.0f,0.0f,0.0f};
-                (void)eskf_nav_reset_world_velocity(&eskf, zero_velocity, ZUPT_SIGMA_MPS);
-                (void)eskf_nav_fuse_zero_rate(&eskf, gyro, zero_rate_sigma);
-                startup_zupt = 1U;
-                auto_rearm_still_count = 0U;
-                zupt_applied = 1U;
-            }
-        } else if (!sample_is_still) {
-            auto_rearm_still_count = 0U;
-        }
+        /* Movement revokes startup ZUPT and the master lease above. */
 
         int allow_zupt = sample_is_still &&
                          (startup_zupt || master_stationary ||
@@ -930,7 +874,7 @@ int main(void)
              * velocity 10 Hz dan zero-rate 10 Hz. Information rate tetap sama,
              * tetapi dua update matriks tidak menumpuk pada satu siklus CPU.
              */
-            if (++zupt_divider >= 5U) {
+            if (++zupt_divider >= IMU_ZUPT_DIVIDER) {
                 zupt_divider = 0U;
                 if (zupt_phase == 0U) {
                     (void)eskf_nav_fuse_zero_velocity(&eskf, ZUPT_SIGMA_MPS);
@@ -963,7 +907,6 @@ int main(void)
                 (void)imu_mpu6xxx_fifo_reset();
                 last_fifo_resync = imu_mpu6xxx_get_fifo_stats()->fifo_resync_count;
                 startup_zupt = 1U;
-                auto_zupt_rearm_enabled = 1U;
             } else {
                 /* RAM calibration candidate belum boleh aktif bila persistence gagal.
                  * Reload record committed terakhir dan laporkan kegagalan eksplisit. */
@@ -1021,7 +964,6 @@ int main(void)
                     (void)imu_mpu6xxx_fifo_reset();
                     last_fifo_resync = imu_mpu6xxx_get_fifo_stats()->fifo_resync_count;
                     startup_zupt = 1U;
-                    auto_zupt_rearm_enabled = 1U;
                 } else {
                     PersistedSettings rollback; int ls=eeprom_settings_load(&rollback);
                     if(ls){settings=rollback;eeprom_valid=1;}else{eeprom_settings_defaults(&settings);eeprom_valid=0;}
@@ -1038,8 +980,6 @@ int main(void)
         } else if (action == VESC_ACTION_ZERO_NAV) {
             eskf_nav_reset_motion(&eskf);
             startup_zupt = 1U;
-            auto_zupt_rearm_enabled = 1U;
-            auto_rearm_still_count = 0U;
             (void)vesc_send_calibration_status(&huart2, CAL_CMD_ZERO_NAV, 0U, &telemetry);
         } else if (action == VESC_ACTION_ZUPT) {
             if (sample_is_still) {
@@ -1051,18 +991,22 @@ int main(void)
                 (void)vesc_send_calibration_status(&huart2, CAL_CMD_ZUPT_ONCE, 1U, &telemetry);
             }
         } else if (action == VESC_ACTION_STATIONARY_ON) {
-            master_stationary = 1U;
-            startup_zupt = 1U;
-            auto_zupt_rearm_enabled = 1U;
-            auto_rearm_still_count = 0U;
-            (void)vesc_send_calibration_status(&huart2, CAL_CMD_STATIONARY_ON, 0U, &telemetry);
+            /* Stop request is an expiring permission, not a permanent state.
+             * IMU 6-axis alone cannot prove zero translational velocity; a
+             * currently moving ESKF cannot be zeroed by master command. */
+            float v2=eskf.velocity[0]*eskf.velocity[0]+eskf.velocity[1]*eskf.velocity[1]+
+                     eskf.velocity[2]*eskf.velocity[2];
+            int safe=sample_is_still && v2<0.0225f;
+            if (safe) {
+                master_stationary=1U;
+                master_stationary_since_us=now_us;
+                startup_zupt=1U;
+            }
+            (void)vesc_send_calibration_status(&huart2, CAL_CMD_STATIONARY_ON, safe?0U:3U, &telemetry);
         } else if (action == VESC_ACTION_STATIONARY_OFF) {
-            /* Master mengetahui kendaraan akan bergerak; jangan menunggu IMU
-             * membuktikan motion karena gerak konstan tidak observable oleh IMU. */
+            /* Master expects commanded motion. Always revoke stationary grant. */
             master_stationary = 0U;
             startup_zupt = 0U;
-            auto_zupt_rearm_enabled = 0U;
-            auto_rearm_still_count = 0U;
             (void)vesc_send_calibration_status(&huart2, CAL_CMD_STATIONARY_OFF, 0U, &telemetry);
         } else if (action == VESC_ACTION_CONFIG) {
             VescConfigRequest req;
@@ -1107,9 +1051,12 @@ int main(void)
                         settings.calibration_flags|=CAL_FLAG_ROTATE_VALID;changed=1;reinit=1;}
                     else {(void)vesc_send_config_status(&huart2,req.subcmd,2U,&settings);continue;}
                 }else if(req.subcmd==CFG_CMD_SET_OUTPUT_MAP){
+                    /* Legacy post-ESKF axis remap membuat quaternion/RPY/vector
+                     * tidak satu frame dan refleksi satu sumbu bukan rotasi valid.
+                     * Hanya izinkan clear; mounting harus lewat sensor_to_body_q. */
                     uint16_t map=(uint16_t)((uint32_t)req.value[0]);
-                    if((map & ~OUTPUT_MAP_MASK)==0U){
-                        settings.reserved=(uint16_t)((settings.reserved & ~OUTPUT_MAP_MASK)|map);
+                    if(map==0U){
+                        settings.reserved=(uint16_t)(settings.reserved & ~OUTPUT_MAP_MASK);
                         changed=1;
                     }else{(void)vesc_send_config_status(&huart2,req.subcmd,2U,&settings);continue;}
                 }else if(req.subcmd==CFG_CMD_RESET_ALL){
@@ -1224,7 +1171,7 @@ int main(void)
                                 if(ok){
                                     aid_status.last_wheel_us=now_us;aid_status.last_any_us=now_us;
                                     if (fabsf(req.value[0]) > MOTION_AID_RELEASE_SPEED_MPS) {
-                                        startup_zupt=0U; auto_rearm_still_count=0U;
+                                        startup_zupt=0U;
                                     }
                                 }
                                 if(ok && (req.flags&AID_FLAG_NHC)){
@@ -1244,7 +1191,7 @@ int main(void)
                             aid_status.last_vel_us=now_us;aid_status.last_any_us=now_us;
                             float v2=req.value[0]*req.value[0]+req.value[1]*req.value[1]+req.value[2]*req.value[2];
                             if(v2 > MOTION_AID_RELEASE_SPEED_MPS*MOTION_AID_RELEASE_SPEED_MPS){
-                                startup_zupt=0U; auto_rearm_still_count=0U;
+                                startup_zupt=0U;
                             }
                         }
                     }else if(req.type==AID_CMD_WORLD_POSITION){

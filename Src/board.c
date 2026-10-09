@@ -22,8 +22,8 @@ static volatile uint16_t uart_tx_index = 0U;
 static volatile uint8_t uart_tx_busy_flag = 0U;
 static volatile uint32_t uart_tx_started_us = 0U;
 
-/* TIM2 dipakai sebagai scheduler IMU 100 Hz. Counter pending membuat tick yang
- * datang ketika CPU masih bekerja tetap terlihat, tanpa menjalankan ESKF di ISR. */
+/* TIM2 scheduler IMU, 100Hz baseline atau 200Hz experimental.
+ * Pending ticks are counted even when CPU is busy (ESKF never runs in ISR). */
 static volatile uint32_t imu_tick_pending = 0U;
 
 static void clock_init(void)
@@ -115,12 +115,12 @@ static void uart_init(void)
 
 static void imu_scheduler_init(void)
 {
-    /* APB1=32 MHz dengan prescaler /2; clock timer APB1 menjadi 64 MHz.
-     * PSC=63 -> counter 1 MHz, ARR=9999 -> update tepat 100 Hz. */
+    /* APB1 timer 64MHz, PSC=63 -> 1MHz counter. Match TIM2 period to
+     * the *selected* service profile; never hard-code the 100Hz ARR. */
     __HAL_RCC_TIM2_CLK_ENABLE();
     TIM2->CR1 = 0U;
     TIM2->PSC = 63U;
-    TIM2->ARR = 9999U;
+    TIM2->ARR = IMU_LOOP_PERIOD_US - 1U;
     TIM2->CNT = 0U;
     TIM2->EGR = TIM_EGR_UG;
     TIM2->SR = 0U;

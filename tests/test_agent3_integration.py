@@ -51,6 +51,23 @@ class Agent3IntegrationTests(unittest.TestCase):
         self.assertIn("MPU6XXX_ACCEL_CONFIG_VALUE", driver)
         self.assertIn("nominal_hz*0.80f", driver)
 
+    def test_1khz_profile_timer_tracks_service_frequency(self):
+        cfg = open(CONFIG, encoding="utf-8").read()
+        board = open(os.path.join(ROOT, "Src", "board.c"), encoding="utf-8").read()
+        main = open(MAIN, encoding="utf-8").read()
+        driver = open(IMU_DRIVER, encoding="utf-8").read()
+        self.assertIn("#define IMU_PROFILE_1KHZ             0U", cfg)
+        self.assertIn("#define MPU6XXX_SAMPLE_HZ          1000UL", cfg)
+        self.assertIn("#define IMU_LOOP_RATE_HZ            200UL", cfg)
+        self.assertIn("#define TELEMETRY_RATE_HZ           100UL", cfg)
+        self.assertIn("TIM2->ARR = IMU_LOOP_PERIOD_US - 1U", board)
+        self.assertIn("ImuSample fifo_samples[IMU_FIFO_BATCH_CAPACITY]", main)
+        self.assertIn("ImuSample samples[IMU_FIFO_BATCH_CAPACITY]", main)
+        self.assertIn("max_samples > IMU_FIFO_BATCH_CAPACITY", driver)
+        self.assertIn("IMU_TEMP_READ_DIVIDER", driver)
+        self.assertIn("IMU_GRAVITY_DIVIDER", main)
+        self.assertIn("IMU_ZUPT_DIVIDER", main)
+
     def test_stationary_startup_initializes_eskf_from_averaged_imu(self):
         main = open(MAIN, encoding="utf-8").read()
         self.assertIn("init_sample.accel_mps2[i]=startup.accel_avg[i]", main)
@@ -158,10 +175,68 @@ class Agent3IntegrationTests(unittest.TestCase):
         payload = bytearray(114)
         payload[0] = read_imu.COMM_SIDEBOARD_IMU
         payload[1] = 5
+        struct.pack_into(">i", payload, 38, 1234)
         data = read_imu.decode_imu(bytes(payload))
         self.assertIsNotNone(data)
         self.assertEqual(data["version"], 5)
         self.assertEqual(data["seq"], 0)
+        self.assertAlmostEqual(data["vel"][0], 1.234, places=3)
+
+    def test_v6_decode_exposes_sensor_epoch_and_highspeed_raw_scale(self):
+        payload = bytearray(118)
+        payload[0] = read_imu.COMM_SIDEBOARD_IMU
+        payload[1] = 6
+        struct.pack_into(">I", payload, 8, 1_000_000)   # snapshot board time
+        struct.pack_into(">h", payload, 12, 4096)       # +1 g at +/-8 g
+        struct.pack_into(">h", payload, 20, 328)        # +10 dps at +/-1000 dps
+        struct.pack_into(">i", payload, 38, 12345)       # vx = 1.2345 m/s in v6
+        struct.pack_into(">i", payload, 50, 23456)       # x = 2.3456 m in v6
+        struct.pack_into(">i", payload, 62, 34567)       # ax_world = 3.4567 m/s2
+        payload[104:114] = struct.pack(">iBBI", 25000, 0x72, 2 | (2 << 2) | (2 << 4), 500000)
+        payload[114:118] = struct.pack(">I", 998000)
+        data = read_imu.decode_imu(bytes(payload))
+        self.assertIsNotNone(data)
+        self.assertEqual(data["version"], 6)
+        self.assertEqual(data["sample_time_us"], 998000)
+        self.assertEqual(data["sensor_lag_us"], 2000)
+        self.assertEqual(data["accel_lsb_per_g"], 4096.0)
+        self.assertEqual(data["accel_fs_sel"], 2)
+        self.assertEqual(data["gyro_fs_sel"], 2)
+        self.assertEqual(data["gyro_lsb_per_dps"], 32.8)
+        self.assertAlmostEqual(data["accel_raw"][0] / data["accel_lsb_per_g"], 1.0)
+        self.assertAlmostEqual(data["gyro_raw"][0] / data["gyro_lsb_per_dps"], 10.0)
+        self.assertAlmostEqual(data["vel"][0], 1.2345, places=4)
+        self.assertAlmostEqual(data["pos"][0], 2.3456, places=4)
+        self.assertAlmostEqual(data["linacc"][0], 3.4567, places=4)
+
+    def test_v6_sensor_lag_handles_u32_wrap(self):
+        payload = bytearray(118)
+        payload[0] = read_imu.COMM_SIDEBOARD_IMU
+        payload[1] = 6
+        struct.pack_into(">I", payload, 8, 0x000003E8)  # 1000 us after wrap
+        meta = 2 | (2 << 2) | (2 << 4)
+        payload[104:114] = struct.pack(">iBBI", 25000, 0x72, meta, 500000)
+        payload[114:118] = struct.pack(">I", 0xFFFFFF00)
+        data = read_imu.decode_imu(bytes(payload))
+        self.assertIsNotNone(data)
+        self.assertEqual(data["sensor_lag_us"], 1256)
+
+    def test_startup_zupt_is_one_shot_after_motion(self):
+        main = open(MAIN, encoding="utf-8").read()
+        cfg = open(CONFIG, encoding="utf-8").read()
+        self.assertNotIn("auto_zupt_rearm_enabled", main)
+        self.assertNotIn("auto_rearm_still_count", main)
+        self.assertNotIn("AUTO_ZUPT_REARM_STILL_SAMPLES", cfg)
+        self.assertIn("if (!sample_is_still) { master_stationary=0U; startup_zupt=0U; }", main)
+        self.assertIn("int allow_zupt = sample_is_still", main)
+        self.assertIn("MASTER_STATIONARY_LEASE_US", main)
+
+    def test_telemetry_keeps_one_canonical_frame(self):
+        main = open(MAIN, encoding="utf-8").read()
+        self.assertNotIn("apply_output_mapping(", main)
+        self.assertNotIn("output_map_vec3(", main)
+        self.assertIn("if(map==0U)", main)
+        self.assertIn("mounting harus lewat sensor_to_body_q", main)
 
     def test_boot_info_is_read_only_and_begin_update_latches(self):
         src = open(BOOT, encoding="utf-8").read()
@@ -179,7 +254,7 @@ class Agent3IntegrationTests(unittest.TestCase):
         self.assertIn("CMD_VERIFY && len == 9U", src)
 
     def test_v4_flash_flow_uses_begin_crc32_and_post_go_check(self):
-        image = b"\x00" * 16
+        image = struct.pack("<II", 0x20005000, 0x08001809) + b"\x00" * 8
         seen = []
 
         def retry(_port, payload, expect_cmd, timeout, attempts=3):
@@ -198,7 +273,7 @@ class Agent3IntegrationTests(unittest.TestCase):
         self.assertEqual(struct.unpack(">I", verify[5:9])[0], flash_uart.crc32_image(image))
 
     def test_v3_host_flash_compatibility_uses_crc16(self):
-        image = b"\x11" * 16
+        image = struct.pack("<II", 0x20005000, 0x08001809) + b"\x11" * 8
         seen = []
 
         def retry(_port, payload, expect_cmd, timeout, attempts=3):

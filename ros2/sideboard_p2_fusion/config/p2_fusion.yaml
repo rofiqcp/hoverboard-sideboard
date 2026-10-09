@@ -43,6 +43,8 @@ sideboard_p2_fusion:
     wheelbase_learning_rate: 0.006
 
     reference_timeout_s: 0.20
+    external_slip_timeout_s: 0.50
+    stale_reference_sigma_floor_mps: 0.50
     scale_min_speed_mps: 0.60
     scale_max_yaw_rate_rads: 0.35
     geometry_min_speed_mps: 0.80
@@ -82,6 +84,9 @@ sideboard_serial_aiding_bridge:
     baud: 921600
     nhc: true
     max_age_us: 14000
+    max_future_skew_us: 10000
+    unknown_wheel_sigma_mps: 0.50
+    steering_valid_timeout_s: 0.25
     reconnect_interval_s: 0.5
     diagnostics_topic: /p2/serial_bridge_diagnostics
     steering_valid_topic: /p2/steering_valid

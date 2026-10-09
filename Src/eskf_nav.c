@@ -369,9 +369,22 @@ void eskf_nav_init(EskfNav *f,const float accel[3]) {
     f->initialized=1U;
 }
 
-void eskf_nav_reset_motion(EskfNav *f) {
-    if(!f) return;
-    for(int i=0;i<3;i++){f->velocity[i]=0;f->position[i]=0;}
+void eskf_nav_reset_motion(EskfNav *f)
+{
+    if(!f)return;
+    /* ZERO_NAV defines a fresh local origin. Old v/p covariance and its
+     * cross-correlations refer to the previous trajectory and must not survive
+     * the coordinate reset. Attitude and sensor-bias knowledge are preserved. */
+    for(int i=0;i<3;i++){f->velocity[i]=0.0f;f->position[i]=0.0f;}
+    for(int axis=0;axis<3;axis++){
+        int vi=IDX_V+axis,pi=IDX_P+axis;
+        for(int j=0;j<ESKF_NAV_DIM;j++){
+            f->P[vi][j]=0.0f;f->P[j][vi]=0.0f;
+            f->P[pi][j]=0.0f;f->P[j][pi]=0.0f;
+        }
+        f->P[vi][vi]=ZUPT_SIGMA_MPS*ZUPT_SIGMA_MPS;
+        f->P[pi][pi]=ZERO_NAV_POSITION_SIGMA_M*ZERO_NAV_POSITION_SIGMA_M;
+    }
 }
 
 void eskf_nav_linear_accel_world(const EskfNav *f,const float accel[3],float out[3]) {
@@ -515,23 +528,29 @@ int eskf_nav_predict_delta(EskfNav *f, const float delta_angle[3],
 int eskf_nav_correct_gravity(EskfNav *f, const float accel[3], int stationary)
 {
     if (!f || !accel || !f->initialized) return 0;
+    /* A 6-axis IMU cannot distinguish vehicle linear acceleration from gravity
+     * tilt. Never consume acceleration as a gravity observation while motion is
+     * unconfirmed; doing so erased ~94% of real 0.02..0.05 g acceleration in
+     * regression. Gyro propagation carries attitude during motion; gravity is
+     * reacquired at confirmed rest/master stationary. */
+    if (!stationary) { f->gravity_reject_count++; return 0; }
     float a[3];
     for (int i=0;i<3;i++) a[i]=accel[i]-f->accel_bias[i];
     float n=sqrtf(a[0]*a[0]+a[1]*a[1]+a[2]*a[2]);
     if (!isfinite(n) || n<1e-4f) { f->gravity_reject_count++; return 0; }
 
     float gr=n/GRAVITY_MPS2;
-    float gate_min=stationary ? ESKF_ACCEL_GATE_MIN_G : ESKF_MOVING_ACCEL_GATE_MIN_G;
-    float gate_max=stationary ? ESKF_ACCEL_GATE_MAX_G : ESKF_MOVING_ACCEL_GATE_MAX_G;
+    float gate_min=ESKF_ACCEL_GATE_MIN_G;
+    float gate_max=ESKF_ACCEL_GATE_MAX_G;
     if (gr<gate_min || gr>gate_max) { f->gravity_reject_count++; return 0; }
 
     const float z[3]={a[0]/n,a[1]/n,a[2]/n};
     float h[3]; gravity_body(f,h);
     float dir_dot=z[0]*h[0]+z[1]*h[1]+z[2]*h[2];
-    float dir_gate=stationary ? ESKF_GRAVITY_DIR_COS_STILL : ESKF_GRAVITY_DIR_COS_MOVING;
+    float dir_gate=ESKF_GRAVITY_DIR_COS_STILL;
     if (!isfinite(dir_dot) || dir_dot<dir_gate) { f->gravity_reject_count++; return 0; }
 
-    float sigma=f->accel_dir_noise*(stationary ? 1.0f : ESKF_MOVING_GRAVITY_NOISE_SCALE);
+    float sigma=f->accel_dir_noise;
     sigma*=1.0f+8.0f*fabsf(gr-1.0f);
     if (!isfinite(sigma) || !(sigma>0.0f)) { f->gravity_reject_count++; return 0; }
 

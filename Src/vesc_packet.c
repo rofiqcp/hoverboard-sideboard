@@ -171,14 +171,16 @@ int vesc_send_extended_imu(UART_HandleTypeDef *uart, const VescImuState *s)
     put_i32(payload, &i, sat_i32(s->pitch_rad * rad_to_mdeg));
     put_i32(payload, &i, sat_i32(s->yaw_rad * rad_to_mdeg));
 
+    /* v6 navigation fixed-point: 1e-4 SI resolution (0.1 mm, 0.1 mm/s).
+     * int32 still covers +/-214 km position, far beyond AGV operating range. */
     for (int k = 0; k < 3; k++) {
-        put_i32(payload, &i, sat_i32(s->velocity[k] * 1000.0f));
+        put_i32(payload, &i, sat_i32(s->velocity[k] * 10000.0f));
     }
     for (int k = 0; k < 3; k++) {
-        put_i32(payload, &i, sat_i32(s->position[k] * 1000.0f));
+        put_i32(payload, &i, sat_i32(s->position[k] * 10000.0f));
     }
     for (int k = 0; k < 3; k++) {
-        put_i32(payload, &i, sat_i32(s->linear_accel_world[k] * 1000.0f));
+        put_i32(payload, &i, sat_i32(s->linear_accel_world[k] * 10000.0f));
     }
 
     payload[i++] = s->cal_state;
@@ -195,8 +197,15 @@ int vesc_send_extended_imu(UART_HandleTypeDef *uart, const VescImuState *s)
     /* v5 extension: temperature sudah dikonversi firmware dengan descriptor sensor,
      * plus identitas sensor dan observed FIFO rate. Prefix v4 tetap byte-identical. */
     put_i32(payload,&i,sat_i32(s->temperature_c*1000.0f));
-    payload[i++]=s->imu_whoami; payload[i++]=s->imu_class;
+    payload[i++]=s->imu_whoami;
+    /* v6 metadata byte: [1:0] device class, [3:2] accel FS_SEL,
+     * [5:4] gyro FS_SEL. No payload growth and host never guesses raw scale. */
+    payload[i++]=(uint8_t)((s->imu_class & 0x03U) |
+                           (((MPU6XXX_ACCEL_CONFIG_VALUE >> 3) & 0x03U) << 2) |
+                           (((MPU6XXX_GYRO_CONFIG_VALUE >> 3) & 0x03U) << 4));
     put_u32(payload,&i,(uint32_t)sat_i32(s->observed_sample_hz*1000.0f));
+    /* v6: epoch state ESKF adalah sampel FIFO terakhir yang telah diintegrasikan. */
+    put_u32(payload,&i,s->raw.sample_time_us);
 
     (void)uart;
     return send_payload_async(payload, i);
@@ -326,7 +335,7 @@ int vesc_send_config_status(UART_HandleTypeDef *uart,uint8_t subcmd,uint8_t stat
         put_i32(payload,&i,sat_i32(s->accel_dir_noise*1000000.0f));
         for(int k=0;k<3;k++)put_i32(payload,&i,sat_i32(s->accel_offset[k]*1000000.0f));
         for(int k=0;k<9;k++)put_i32(payload,&i,sat_i32(s->accel_transform[k]*1000000.0f));
-        put_u16(payload,&i,(uint16_t)(s->reserved & OUTPUT_MAP_MASK));
+        put_u16(payload,&i,0U); /* legacy output-map disabled; canonical frame only */
     }
     return send_payload(uart,payload,i);
 }

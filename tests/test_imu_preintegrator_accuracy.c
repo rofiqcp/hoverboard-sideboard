@@ -120,6 +120,46 @@ static int run_planar_accuracy_500hz(void)
     return velocity_error<0.001 && position_error<0.02;
 }
 
+static int run_planar_accuracy_1000hz(void)
+{
+    const double sensor_dt=0.001;
+    const int intervals=20000;
+    const double yaw_rate=1.2;
+    float a0[3]={0.0f,0.0f,GRAVITY_MPS2};
+    EskfNav f; eskf_nav_init(&f,a0);
+    f.gyro_noise=1e-6f; f.accel_noise=1e-6f;
+    f.gyro_bias_walk=0.0f; f.accel_bias_walk=0.0f;
+
+    ImuPreintegrator p; imu_preintegrator_init(&p);
+    float gyro[3],accel[3]; planar_sensor(0.0,yaw_rate,gyro,accel);
+    imu_preintegrator_push(&p,gyro,accel,(float)sensor_dt);
+    double vx=0.0,vy=0.0,px=0.0,py=0.0;
+    double prev_ax=0.0,prev_ay=1.0;
+    for(int k=1;k<=intervals;k++){
+        double t=(double)k*sensor_dt;
+        planar_sensor(t,yaw_rate,gyro,accel);
+        imu_preintegrator_push(&p,gyro,accel,(float)sensor_dt);
+
+        double ax=1.5*sin(0.4*t), ay=cos(0.6*t);
+        double nvx=vx+0.5*(prev_ax+ax)*sensor_dt;
+        double nvy=vy+0.5*(prev_ay+ay)*sensor_dt;
+        px+=0.5*(vx+nvx)*sensor_dt;
+        py+=0.5*(vy+nvy)*sensor_dt;
+        vx=nvx; vy=nvy; prev_ax=ax; prev_ay=ay;
+
+        if((k%5)==0){
+            ImuDelta d;
+            if(!imu_preintegrator_take(&p,&d) ||
+               !eskf_nav_predict_delta(&f,d.delta_angle,d.delta_velocity,d.dt)) return 0;
+        }
+    }
+    double velocity_error=hypot((double)f.velocity[0]-vx,(double)f.velocity[1]-vy);
+    double position_error=hypot((double)f.position[0]-px,(double)f.position[1]-py);
+    printf("1000Hz->200Hz planar preintegration: velocity_error=%.9g m/s position_error=%.9g m\n",
+           velocity_error,position_error);
+    return velocity_error<0.001 && position_error<0.02;
+}
+
 static void coning_rate(double t, float w[3])
 {
     const double amplitude=1.5, frequency=3.0;
@@ -172,9 +212,11 @@ int main(void)
 {
     int ok_planar=run_planar_accuracy();
     int ok_planar500=run_planar_accuracy_500hz();
+    int ok_planar1000=run_planar_accuracy_1000hz();
     int ok_coning=run_coning_accuracy();
     printf("%s: 200->100 Hz planar preintegration accuracy\n",ok_planar?"PASS":"FAIL");
     printf("%s: 500->100 Hz planar preintegration accuracy\n",ok_planar500?"PASS":"FAIL");
+    printf("%s: 1000->200 Hz planar preintegration accuracy\n",ok_planar1000?"PASS":"FAIL");
     printf("%s: coning compensation accuracy\n",ok_coning?"PASS":"FAIL");
-    return (ok_planar&&ok_planar500&&ok_coning)?0:1;
+    return (ok_planar&&ok_planar500&&ok_planar1000&&ok_coning)?0:1;
 }

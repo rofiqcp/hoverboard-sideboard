@@ -57,8 +57,9 @@ def main():
         if len(v)!=12:ap.error("accel-cal butuh offset xyz lalu matrix 3x3 row-major (12 nilai)")
         req+=struct.pack(">12i",*(round(x*1e6) for x in v))
     elif a.command=="output-map":
-        if len(v)!=1 or int(v[0])!=v[0] or not 0<=int(v[0])<=15:ap.error("output-map butuh mask integer 0..15")
-        req+=bytes((int(v[0]),))
+        if len(v)!=1 or int(v[0])!=0:
+            ap.error("output-map legacy dinonaktifkan; hanya nilai 0 untuk clear. Gunakan mount-rpy untuk orientasi sensor.")
+        req+=bytes((0,))
     elif v:ap.error("command ini tidak menerima values")
     print(f"Sideboard target: {a.port} @ {a.baud}")
     try:d=request(req,sub,a.port,a.baud,max(a.overall_timeout,1.0))

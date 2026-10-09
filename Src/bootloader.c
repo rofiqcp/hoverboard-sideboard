@@ -433,8 +433,10 @@ static uint8_t process_payload(const uint8_t *p, uint8_t len)
             reply[0]=CMD_ERASE; reply[1]=3U; send_packet(reply,2U); return 1U;
         }
         reply[0] = CMD_ERASE;
+        /* Manifest becomes invalid as soon as the erase starts. If erase
+         * fails/power drops midway, never advertise a stale cached app. */
+        cached_app_valid = 0U;
         reply[1] = erase_app() ? 0U : 1U;
-        if (reply[1] == 0U) cached_app_valid = 0U;
         send_packet(reply, 2U);
         return 1U;
     }

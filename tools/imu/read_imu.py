@@ -11,11 +11,14 @@ import sys
 import time
 import serial
 import weakref
-from serial_common import find_sideboard_port, open_sideboard_port
+from serial_common import open_sideboard_port, sideboard_candidates
 from flash_uart import catch_bootloader,parse_info,transact,CMD_GO
 
 PORT_DEFAULT = "auto"
 BAUD_DEFAULT = 921600
+
+ACCEL_LSB_PER_G_BY_FS = {0: 16384.0, 1: 8192.0, 2: 4096.0, 3: 2048.0}
+GYRO_LSB_PER_DPS_BY_FS = {0: 131.0, 1: 65.5, 2: 32.8, 3: 16.4}
 COMM_SIDEBOARD_IMU = 0xF0
 COMM_SIDEBOARD_DIAG = 0xF5
 
@@ -40,6 +43,22 @@ def read_exact(port: serial.Serial, count: int) -> bytes:
 
 
 _RX_BUFFERS = weakref.WeakKeyDictionary()
+
+
+def _nested_frame_start(buf):
+    """Locate CRC-valid frame behind a truncated hotplug prefix."""
+    for pos in range(1, max(1, len(buf) - 4)):
+        if buf[pos] != 2 or pos + 5 > len(buf):
+            continue
+        n = buf[pos+1]
+        if not 0 < n <= 192 or pos+n+5 > len(buf):
+            continue
+        q = pos+2+n
+        if buf[q+2] == 3 and crc16(bytes(buf[pos+2:q])) == (
+                (buf[q] << 8) | buf[q+1]):
+            return pos
+    return None
+
 
 def read_frame(port: serial.Serial):
     """Sliding VESC frame parser yang tahan buka-port di tengah stream/byte corrupt.
@@ -67,6 +86,10 @@ def read_frame(port: serial.Serial):
                 del buf[0]; last_error = "length"; continue
             total = 2 + n + 3
             if len(buf) < total:
+                nested = _nested_frame_start(buf)
+                if nested is not None:
+                    del buf[:nested]
+                    continue
                 break
             payload = bytes(buf[2:2+n])
             crc_rx = (buf[2+n] << 8) | buf[3+n]
@@ -86,9 +109,50 @@ def read_frame(port: serial.Serial):
     return None, last_error
 
 
+def open_telemetry_port(requested="auto", baud=BAUD_DEFAULT, timeout=0.05,
+                        attempts=5, delay=0.20):
+    """Buka port yang benar-benar teridentifikasi sebagai sideboard.
+
+    Untuk port eksplisit, hormati pilihan user. Untuk auto, setiap kandidat
+    harus mengirim telemetry F0/F5 valid secara pasif. Ini mencegah
+    ESC/Android/serial lain menerima probe aktif atau terpilih keliru.
+    """
+    if requested not in ("auto", "AUTO", None):
+        return open_sideboard_port(requested, baud, timeout=timeout,
+                                   attempts=attempts, delay=delay)
+    last_error = None
+    for outer in range(max(attempts, 1)):
+        candidates = sideboard_candidates()
+        for candidate in candidates:
+            port = None
+            try:
+                port = open_sideboard_port(candidate, baud, timeout=timeout,
+                                           attempts=1, delay=delay)
+                port.reset_input_buffer()
+                payload, _ = read_frame(port)
+                if decode_imu(payload) is not None or decode_diag(payload) is not None:
+                    accepted = port
+                    port = None
+                    return accepted
+
+            except (FileNotFoundError, serial.SerialException, OSError, RuntimeError) as exc:
+                last_error = exc
+            finally:
+                try:
+                    if port is not None and port.is_open:
+                        port.close()
+                except Exception:
+                    pass
+        if outer + 1 < attempts:
+            time.sleep(delay)
+    if last_error is not None:
+        raise last_error
+    raise FileNotFoundError("Sideboard tidak ditemukan: tidak ada kandidat yang lolos probe F0/F5/bootloader.")
+
+
 def decode_imu(payload: bytes):
-    """Decode protocol v2 (79), v3 (101), dan v4 validity (104 byte)."""
-    if not payload or payload[0] != COMM_SIDEBOARD_IMU or len(payload) not in (79, 101, 104, 114):
+    """Decode telemetry v2..v6; v6 menambahkan epoch sampel IMU."""
+    if not payload or payload[0] != COMM_SIDEBOARD_IMU or len(payload) not in (79, 101, 104, 114, 118):
         return None
     if len(payload) == 79:
         fields = struct.unpack(">BBHII7h12iBBBH", payload)
@@ -106,29 +170,53 @@ def decode_imu(payload: bytes):
     px,py,pz = fields[18:21]
     lax,lay,laz = fields[21:24]
     cal_state,coverage,cal_error,cal_progress = fields[24:28]
+    nav_scale = 10000.0 if version >= 6 else 1000.0
     data = {
         "command": command, "version": version, "flags": flags,
         "seq": seq, "time_us": time_us,
         "accel_raw": (ax, ay, az), "temp_raw": temp, "gyro_raw": (gx, gy, gz),
         "roll": roll_md / 1000.0, "pitch": pitch_md / 1000.0, "yaw": yaw_md / 1000.0,
-        "vel": (vx/1000.0,vy/1000.0,vz/1000.0), "pos": (px/1000.0,py/1000.0,pz/1000.0),
-        "linacc": (lax/1000.0,lay/1000.0,laz/1000.0), "cal": (cal_state,coverage,cal_error,cal_progress),
+        "vel": (vx/nav_scale,vy/nav_scale,vz/nav_scale), "pos": (px/nav_scale,py/nav_scale,pz/nav_scale),
+        "linacc": (lax/nav_scale,lay/nav_scale,laz/nav_scale), "cal": (cal_state,coverage,cal_error,cal_progress),
         "aid_age_ms": 65535, "aid_reject": 0,
         "att_std_deg": (0.0,0.0,0.0), "vel_std": (0.0,0.0,0.0), "pos_std": (0.0,0.0,0.0),
         "nav_status": 0, "health_resets": 0,
         "temp_c": temp / 340.0 + 36.53, "imu_whoami": 0, "imu_class": 0, "observed_sample_hz": 0.0,
+        "sample_time_us": time_us, "sensor_lag_us": 0,
+        "accel_fs_sel": None, "gyro_fs_sel": None,
+        "accel_lsb_per_g": 8192.0, "gyro_lsb_per_dps": 65.5,
     }
     if extra:
         data["aid_age_ms"], data["aid_reject"] = extra[:2]
         data["att_std_deg"] = tuple(x/1000.0 for x in extra[2:5])
         data["vel_std"] = tuple(x/1000.0 for x in extra[5:8])
         data["pos_std"] = tuple(x/1000.0 for x in extra[8:11])
-    if len(payload) in (104,114):
+    if len(payload) in (104,114,118):
         data["nav_status"] = fields[39]
         data["health_resets"] = fields[40]
-    if len(payload) == 114:
-        temp_md,who,klass,rate_mhz=struct.unpack(">iBBI",payload[104:114])
-        data["temp_c"]=temp_md/1000.0; data["imu_whoami"]=who; data["imu_class"]=klass; data["observed_sample_hz"]=rate_mhz/1000.0
+    if len(payload) in (114,118):
+        temp_md,who,klass_meta,rate_mhz=struct.unpack(">iBBI",payload[104:114])
+        data["temp_c"]=temp_md/1000.0
+        data["imu_whoami"]=who
+        data["observed_sample_hz"]=rate_mhz/1000.0
+        if len(payload) == 118:
+            data["imu_class"] = klass_meta & 0x03
+            accel_fs = (klass_meta >> 2) & 0x03
+            gyro_fs = (klass_meta >> 4) & 0x03
+            data["accel_fs_sel"] = accel_fs
+            data["gyro_fs_sel"] = gyro_fs
+            data["accel_lsb_per_g"] = ACCEL_LSB_PER_G_BY_FS[accel_fs]
+            data["gyro_lsb_per_dps"] = GYRO_LSB_PER_DPS_BY_FS[gyro_fs]
+            sample_time_us = struct.unpack(">I", payload[114:118])[0]
+            data["sample_time_us"] = sample_time_us
+            lag = (time_us - sample_time_us) & 0xFFFFFFFF
+            data["sensor_lag_us"] = lag if lag < 0x80000000 else lag - 0x100000000
+        else:
+            data["imu_class"] = klass_meta
+            # Legacy v5 tidak membawa FS_SEL; pertahankan compatibility profile.
+            if data["observed_sample_hz"] >= 300.0:
+                data["accel_lsb_per_g"] = 4096.0
+                data["gyro_lsb_per_dps"] = 32.8
     return data
 
 def decode_diag(payload: bytes):
@@ -235,11 +323,12 @@ def main():
                         help="Tampilkan tiap N frame; default 5 = sekitar 10 Hz dari stream 50 Hz")
     parser.add_argument("--count", type=int, default=0,
                         help="Berhenti setelah jumlah frame valid ini; 0 berarti terus")
-    parser.add_argument("--mode", choices=("raw","ready","all","diag"), default="all",
-                        help="raw=sensor mentah, ready=data siap pakai, all=diagnostik lengkap")
+    parser.add_argument("--mode", choices=("raw","ready","nav","all","diag"), default="all",
+                        help="raw=sensor mentah, ready=data siap pakai, nav=x/y/z+vx/vy/vz realtime, all=diagnostik lengkap")
     args = parser.parse_args()
 
     valid = crc_errors = other_errors = lost = reconnects = reboots = 0
+    lag_count = lag_sum_us = lag_max_us = 0
     diag_frames = 0
     last_diag = None
     last_seq = last_time_us = None
@@ -254,8 +343,8 @@ def main():
         while args.count == 0 or valid < args.count:
             try:
                 if port is None or not port.is_open:
-                    port = open_sideboard_port(args.port, args.baud, timeout=0.05,
-                                               attempts=5, delay=0.20)
+                    port = open_telemetry_port(args.port, args.baud, timeout=0.05,
+                                                attempts=5, delay=0.20)
                     port.reset_input_buffer()
                     print(f"Membaca {port.port} @ {args.baud} baud ..."
                           + (" (reconnect)" if reconnects else ""))
@@ -311,17 +400,27 @@ def main():
                         reboots += 1
                 last_seq = data["seq"]
                 last_time_us = data["time_us"]
+                sample_time_us = data.get("sample_time_us", data["time_us"])
+                sensor_lag_us = data.get("sensor_lag_us", 0)
+                if data.get("version", 0) >= 6 and abs(sensor_lag_us) < 1000000:
+                    lag_count += 1
+                    lag_sum_us += sensor_lag_us
+                    lag_max_us = max(lag_max_us, abs(sensor_lag_us))
                 valid += 1
 
                 if valid == 1 or valid % max(args.every, 1) == 0:
                     ax, ay, az = data["accel_raw"]
                     gx, gy, gz = data["gyro_raw"]
-                    ag = (ax / 8192.0, ay / 8192.0, az / 8192.0)
-                    gd = (gx / 65.5, gy / 65.5, gz / 65.5)
+                    highspeed = data.get("observed_sample_hz", 0.0) >= 300.0
+                    accel_scale = data.get("accel_lsb_per_g", 4096.0 if highspeed else 8192.0)
+                    gyro_scale = data.get("gyro_lsb_per_dps", 32.8 if highspeed else 65.5)
+                    ag = (ax / accel_scale, ay / accel_scale, az / accel_scale)
+                    gd = (gx / gyro_scale, gy / gyro_scale, gz / gyro_scale)
                     temp_c = data["temp_c"]
                     if args.mode == "raw":
                         print(
                             f"RAW seq={data['seq']:8d} t={data['time_us']:10d}us "
+                            f"sample_t={sample_time_us:10d}us lag={sensor_lag_us:5d}us "
                             f"Araw=({ax:6d},{ay:6d},{az:6d}) "
                             f"Graw=({gx:6d},{gy:6d},{gz:6d}) Traw={data['temp_raw']:6d} "
                             f"A[g]=({ag[0]:+.4f},{ag[1]:+.4f},{ag[2]:+.4f}) "
@@ -336,8 +435,21 @@ def main():
                             f"V=({data['vel'][0]:+.3f},{data['vel'][1]:+.3f},{data['vel'][2]:+.3f})m/s "
                             f"P=({data['pos'][0]:+.3f},{data['pos'][1]:+.3f},{data['pos'][2]:+.3f})m "
                             f"stdV=({data['vel_std'][0]:.3f},{data['vel_std'][1]:.3f},{data['vel_std'][2]:.3f}) "
-                            f"T={temp_c:.2f}C flags=[{flag_text(data['flags'])}] "
+                            f"lag={sensor_lag_us}us T={temp_c:.2f}C flags=[{flag_text(data['flags'])}] "
                             f"nav=[{nav_text(data['nav_status'])}] resets={data['health_resets']}"
+                        )
+                    elif args.mode == "nav":
+                        px, py, pz = data["pos"]
+                        vx, vy, vz = data["vel"]
+                        sx, sy, sz = data["pos_std"]
+                        svx, svy, svz = data["vel_std"]
+                        print(
+                            f"NAV seq={data['seq']:8d} sample_t={sample_time_us:10d}us lag={sensor_lag_us:5d}us "
+                            f"x={px:+.4f} y={py:+.4f} z={pz:+.4f}m "
+                            f"vx={vx:+.4f} vy={vy:+.4f} vz={vz:+.4f}m/s "
+                            f"stdP=({sx:.4f},{sy:.4f},{sz:.4f})m "
+                            f"stdV=({svx:.4f},{svy:.4f},{svz:.4f})m/s "
+                            f"nav=[{nav_text(data['nav_status'])}]"
                         )
                     else:
                         print(
@@ -374,9 +486,10 @@ def main():
 
     elapsed = max(time.monotonic() - started, 1e-6)
     stream_hz = seq_advance_total / max(sensor_elapsed_us * 1.0e-6, 1e-6) if sensor_elapsed_us else 0.0
+    lag_text = (f", sensor_lag_avg={lag_sum_us/lag_count:.0f}us max={lag_max_us}us" if lag_count else "")
     print(f"Ringkasan: valid={valid}, hilang_seq={lost}, crc_error={crc_errors}, "
           f"error_lain={other_errors}, reconnect={reconnects}, reboot/reset={reboots}, "
-          f"diag={diag_frames}, stream={stream_hz:.1f} Hz, laju_host_total={valid/elapsed:.1f} frame/s")
+          f"diag={diag_frames}, stream={stream_hz:.1f} Hz, laju_host_total={valid/elapsed:.1f} frame/s{lag_text}")
     if interrupted:
         raise KeyboardInterrupt
     return 0
